@@ -179,27 +179,172 @@ class TestStreamDecoder(unittest.TestCase):
         self.assertEqual(dec.dropped_bytes, 100 * 256)
 
 
-class TestRS485Stub(unittest.TestCase):
-    """Заготовка RS485 должна честно сообщать, что не реализована."""
+#: Один полный цикл обмена, снятый с шины контроллера фанкойла AUX.
+#: Байты 0xFE между кадрами — не опечатка: это огрызки от переключения
+#: направления линии, см. «Артефакты линии» в aux_hvac.rs485_protocol.
+RS485_CYCLE = bytes.fromhex("".join((
+    "7EF101550A00001135C6",
+    "FE",
+    "7E01F1022B031100110122014000C0FC10E400000000FA00C800C800F7"
+    "0000000037011904010101329DB5",
+    "7EF100A115000000000000000000000000110AF39B",
+    "7EF1F112110A04000000000000000063A4",
+    "7EF1F1121D170A00000000000000000000000000000000000000002459",
+    "7EF1F112172E070000000000111904010100000000BB16",
+    "7EF1F0A515C806000000000000000000000000F9F2",
+    "7E01E1550A000011D3A9",
+    "7EF1C1550A00001124C6",
+    "7EF1C2550A00001124F5",
+    "7EF1CF550A00001125E8",
+    "7EF101550A00001135C6",
+    "FE",
+    "7E01F1010D1200010400007615",
+    "7EF100A115000000000000000000000000110AF39B",
+    "7EF1F112110A04000000000000000063A4",
+    "7EF1F1121D170A00000000000000000000000000000000000000002459",
+    "7EF1F112172E070000000000111904010100000000BB16",
+    "7EF1F0A515C806000000000000000000000000F9F2",
+    "7E01E1550A000011D3A9",
+    "7EF1C1550A00001124C6",
+    "7EF1C2550A00001124F5",
+    "7EF1CF550A00001125E8",
+)))
 
-    def test_encoder_refuses_explicitly(self):
-        from aux_hvac.rs485_protocol import NotDecodedYet, RS485Frame, request_status
+#: Сколько кадров и огрызков в этом цикле.
+RS485_CYCLE_FRAMES = 22
+RS485_CYCLE_RUNTS = 2
 
-        with self.assertRaises(NotDecodedYet):
-            RS485Frame(raw=b"\x01\x02").encode()
-        with self.assertRaises(NotDecodedYet):
-            request_status(1)
 
-    def test_raw_capture_still_works(self):
-        """Снять дамп шины можно уже сейчас — это и есть смысл заготовки."""
+class TestRS485Frame(unittest.TestCase):
+    """Кадровый уровень RS485 расшифрован — проверяем его на реальном дампе."""
+
+    def frames(self):
         from aux_hvac.rs485_protocol import RS485Decoder
 
         dec = RS485Decoder()
-        dec.feed(b"\x01\x02\x03")
-        frames = dec.flush()
-        self.assertEqual(len(frames), 1)
-        self.assertEqual(frames[0].raw, b"\x01\x02\x03")
-        self.assertEqual(dec.flush(), [])
+        return dec.feed(RS485_CYCLE), dec
+
+    def test_cycle_decodes_without_a_single_bad_crc(self):
+        """CRC16/MODBUS должна сойтись на всех кадрах цикла."""
+        frames, dec = self.frames()
+        self.assertEqual(len(frames), RS485_CYCLE_FRAMES)
+        self.assertEqual(dec.bad_crc, 0)
+        self.assertTrue(all(f.crc_ok for f in frames))
+
+    def test_line_turnaround_runt_is_counted_not_swallowed(self):
+        """Огрызок 0xFE не должен ломать разбор, но и теряться молча тоже."""
+        frames, dec = self.frames()
+        self.assertEqual(dec.dropped_bytes, RS485_CYCLE_RUNTS)
+        self.assertEqual(len(frames), RS485_CYCLE_FRAMES)
+
+    def test_reencode_is_byte_exact(self):
+        """Сборка кадра обязана давать те же байты, что пришли из линии."""
+        frames, _ = self.frames()
+        for frame in frames:
+            self.assertEqual(frame.encode(), frame.raw)
+
+    def test_length_byte_covers_whole_frame(self):
+        """LEN — длина всего кадра, включая стартовый байт и CRC."""
+        frames, _ = self.frames()
+        for frame in frames:
+            self.assertEqual(frame.raw[4], len(frame.raw))
+
+    def test_request_status_matches_observed_poll(self):
+        """Собранный опрос должен совпасть с наблюдённым байт в байт."""
+        from aux_hvac.rs485_protocol import request_status
+
+        self.assertEqual(request_status(0xF1, 0x01),
+                         bytes.fromhex("7EF101550A00001135C6"))
+
+    def test_every_single_bit_flip_breaks_crc(self):
+        """Одиночная ошибка бита обязана ловиться контрольной суммой."""
+        from aux_hvac.rs485_protocol import RS485Frame
+
+        good = bytes.fromhex("7EF101550A00001135C6")
+        for pos in range(1, len(good)):
+            for bit in range(8):
+                broken = bytearray(good)
+                broken[pos] ^= 1 << bit
+                self.assertFalse(
+                    RS485Frame.decode(bytes(broken)).crc_ok,
+                    "порча байта %d бита %d осталась незамеченной" % (pos, bit),
+                )
+
+    def test_register_block_model_holds_for_every_data_frame(self):
+        """Нагрузка кадра с данными = индекс, количество и столько же слов."""
+        frames, _ = self.frames()
+        blocks = [f.block for f in frames if f.block is not None]
+        self.assertEqual(len(blocks), 9)
+        for block in blocks:
+            self.assertEqual(len(block.encode()), 2 + 2 * block.count)
+            self.assertEqual(block.count, len(block.items()))
+
+    def test_temperatures_of_the_big_frame(self):
+        """Регистры 10..13 кадра CMD=0x02 — это те самые 25.0/20.0/20.0/24.7."""
+        frames, _ = self.frames()
+        big = [f for f in frames if f.cmd == 0x02][0]
+        block = big.block
+        self.assertEqual(block.index, 3)
+        self.assertEqual(block.count, 17)
+        values = dict(block.items())
+        self.assertEqual([values[r] for r in (10, 11, 12, 13)], [250, 200, 200, 247])
+        self.assertAlmostEqual(block.as_celsius(values[10]), 25.0)
+        self.assertAlmostEqual(block.as_celsius(values[13]), 24.7)
+        # -100.8 похоже на «датчик не подключён», температурой это не считаем
+        self.assertIsNone(block.as_celsius(values[7]))
+
+    def test_register_values_are_big_endian(self):
+        """Значения регистров big-endian, а CRC — little-endian. Так в линии."""
+        frames, _ = self.frames()
+        big = [f for f in frames if f.cmd == 0x02][0]
+        # 0x00FA = 250; при обратном порядке вышло бы 0xFA00 = 64000
+        self.assertEqual(dict(big.block.items())[10], 250)
+        self.assertEqual(big.crc, big.raw[-2] | (big.raw[-1] << 8))
+
+    def test_poll_frame_is_not_a_register_block(self):
+        """Короткий опрос под модель регистров не подходит — и не должен."""
+        frames, _ = self.frames()
+        poll = [f for f in frames if f.cmd == 0x55][0]
+        self.assertIsNone(poll.block)
+        self.assertEqual(poll.payload, bytes([0x00, 0x00, 0x11]))
+
+    def test_stream_survives_arbitrary_chunking(self):
+        """Разбор не должен зависеть от того, как поток нарезан по чтениям."""
+        from aux_hvac.rs485_protocol import RS485Decoder
+
+        reference = [f.raw for f in self.frames()[0]]
+        for size in range(1, 45):
+            dec = RS485Decoder()
+            got = []
+            for k in range(0, len(RS485_CYCLE), size):
+                got.extend(f.raw for f in dec.feed(RS485_CYCLE[k:k + size]))
+            self.assertEqual(got, reference, "сломалось при чтении по %d байт" % size)
+
+    def test_garbage_before_frames_is_dropped_not_fatal(self):
+        """Мусор перед кадром отбрасывается, кадры после него читаются."""
+        from aux_hvac.rs485_protocol import RS485Decoder
+
+        dec = RS485Decoder()
+        frames = dec.feed(b"\xff\x00\x7e\x01" + RS485_CYCLE)
+        self.assertEqual(len(frames), RS485_CYCLE_FRAMES)
+        self.assertGreaterEqual(dec.dropped_bytes, 4)
+
+    def test_buffer_is_bounded_on_endless_garbage(self):
+        """Поток без единого кадра не должен раздувать буфер."""
+        from aux_hvac.rs485_protocol import RS485Decoder
+
+        dec = RS485Decoder()
+        for _ in range(100):
+            self.assertEqual(dec.feed(b"\x00" * 256), [])
+        self.assertEqual(dec.dropped_bytes, 100 * 256)
+
+    def test_semantics_still_refuse_to_guess(self):
+        """Смысл регистров не расшифрован — parse_status обязан это сказать."""
+        from aux_hvac.rs485_protocol import NotDecodedYet, parse_status
+
+        frames, _ = self.frames()
+        with self.assertRaises(NotDecodedYet):
+            parse_status(frames[1])
 
 
 if __name__ == "__main__":

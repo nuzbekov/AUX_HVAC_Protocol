@@ -578,6 +578,140 @@ def cmd_replay(args) -> int:
     return 0
 
 
+def cmd_rs485(args) -> int:
+    """Разбирает дамп шины RS485.
+
+    Кадровый уровень расшифрован, поэтому кадры печатаются полями. Смысл
+    регистров нет, поэтому они выводятся как «индекс = значение» — см.
+    :mod:`aux_hvac.rs485_protocol`.
+
+    По умолчанию печатается сводка: уникальные кадры и цикл обмена. Дампы
+    шины почти целиком состоят из повторов одного цикла, и покадровый вывод
+    в них бесполезен. Разбор регистра по величине даёт ``--diff``: он
+    сравнивает два дампа и показывает только те регистры, что изменились.
+    """
+    from aux_hvac.rs485_protocol import RS485Decoder
+
+    def read_frames(path):
+        dec = RS485Decoder()
+        with open(path, "rb") as fh:
+            data = fh.read()
+        frames = dec.feed(data)
+        dec.flush()
+        return data, frames, dec
+
+    data, frames, dec = read_frames(args.file)
+
+    if args.diff:
+        # смысл регистров ищется именно так: меняем одну величину и смотрим,
+        # какой регистр поехал
+        _, other, _ = read_frames(args.diff)
+        before = {}
+        for f in frames:
+            before.setdefault(_rs485_key(f), f)
+        # цикл опроса повторяется в дампе много раз, поэтому одно и то же
+        # изменение встретится столько же раз — считаем повторы и печатаем
+        # каждое изменение одной строкой
+        changes, order = {}, []
+        for f in other:
+            key = _rs485_key(f)
+            was_frame = before.get(key)
+            if was_frame is None:
+                line = "  НОВЫЙ кадр: %s" % f.describe()
+            elif was_frame.payload == f.payload:
+                continue
+            else:
+                ob, nb = was_frame.block, f.block
+                if ob is not None and nb is not None and ob.index == nb.index:
+                    for (reg, was), (_, now) in zip(ob.items(), nb.items()):
+                        if was == now:
+                            continue
+                        line = ("  %02X %02X cmd=%02X рег %-3d %6d -> %-6d%s"
+                                % (f.addr_a, f.addr_b, f.cmd, reg, was, now,
+                                   _rs485_delta(was, now)))
+                        if line not in changes:
+                            order.append(line)
+                        changes[line] = changes.get(line, 0) + 1
+                    continue
+                line = ("  %02X %02X cmd=%02X нагрузка: %s -> %s"
+                        % (f.addr_a, f.addr_b, f.cmd,
+                           hexdump(was_frame.payload), hexdump(f.payload)))
+            if line not in changes:
+                order.append(line)
+            changes[line] = changes.get(line, 0) + 1
+
+        print("Сравнение %s -> %s" % (args.file, args.diff))
+        if not changes:
+            print("  различий нет: в дампах одни и те же значения")
+            return 0
+        for line in order:
+            count = changes[line]
+            print("%s%s" % (line, "" if count == 1 else "   x%d" % count))
+        print("Изменившихся регистров: %d." % len(order))
+        return 0
+
+    uniq = {}
+    order = []
+    for f in frames:
+        key = bytes(f.raw)
+        if key not in uniq:
+            order.append(f)
+        uniq[key] = uniq.get(key, 0) + 1
+
+    if args.all:
+        for f in frames:
+            print(f.describe())
+        print("")
+
+    print("Уникальные кадры (в порядке появления):")
+    for f in order:
+        print("  x%-3d %s" % (uniq[bytes(f.raw)], f.describe()))
+
+    print("\nАдреса и команды:")
+    pairs = {}
+    for f in frames:
+        pairs.setdefault((f.addr_a, f.addr_b, f.cmd), 0)
+        pairs[(f.addr_a, f.addr_b, f.cmd)] += 1
+    for (a, b, cmd), count in sorted(pairs.items()):
+        print("  %02X %02X  cmd %02X : %d" % (a, b, cmd, count))
+
+    period = _rs485_period(data)
+    print("\nИтого: %d байт, кадров %d, битых CRC %d, мусорных байт %d."
+          % (len(data), len(frames), dec.bad_crc, dec.dropped_bytes))
+    if period:
+        print("Дамп периодичен: цикл %d байт, повторов %.1f."
+              % (period, len(data) / float(period)))
+        print("ВНИМАНИЕ: в статичном дампе смысл регистров определить нельзя.")
+        print("Снимите второй дамп после изменения одной величины и сравните:")
+        print("  python aux_tool.py rs485 %s --diff второй.bin" % args.file)
+    return 0
+
+
+def _rs485_key(frame):
+    """Опознаёт кадр: адреса, команда и индекс блока регистров."""
+    return (frame.addr_a, frame.addr_b, frame.cmd, bytes(frame.payload[:2]))
+
+
+def _rs485_delta(was, now):
+    """Подсказка о величине изменения, если значения похожи на температуру."""
+    if abs(was) > 1000 or abs(now) > 1000:
+        return ""
+    return "  (%.1f -> %.1f, на %+.1f)" % (was / 10.0, now / 10.0, (now - was) / 10.0)
+
+
+def _rs485_period(data: bytes):
+    """Длина цикла повторения дампа или None, если повторов нет.
+
+    Дампы шины — это один и тот же цикл опроса, повторённый много раз.
+    Знать его длину полезно: если дамп целиком периодичен, значит за время
+    записи не изменилось ничего, и искать в нём смысл регистров бесполезно.
+    """
+    for period in range(10, len(data) // 2):
+        if data[:len(data) - period] == data[period:]:
+            return period
+    return None
+
+
 def cmd_ports(args) -> int:
     from aux_hvac import list_ports
     from aux_hvac.transport.base import TransportError
@@ -663,6 +797,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true", help="вывод в JSON")
     p.add_argument("--bits", action="store_true", help="показать побайтную раскладку")
     p.set_defaults(func=cmd_replay)
+
+    p = sub.add_parser("rs485", help="разобрать дамп шины RS485")
+    p.add_argument("file", help="сырой бинарный дамп шины")
+    p.add_argument("--all", action="store_true", help="печатать все кадры, а не только уникальные")
+    p.add_argument("--diff", metavar="ФАЙЛ",
+                   help="сравнить с другим дампом и показать изменившиеся регистры")
+    p.set_defaults(func=cmd_rs485)
 
     p = sub.add_parser("ports", help="список доступных COM-портов")
     p.set_defaults(func=cmd_ports)

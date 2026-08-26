@@ -84,6 +84,10 @@ from aux_hvac import (  # noqa: E402
     request_outdoor,
 )
 from aux_hvac.const import UART_BAUDRATE, UART_PARITY  # noqa: E402
+from aux_hvac.transport.rs485 import (  # noqa: E402
+    RS485_BAUDRATE,
+    RS485_PARITY,
+)
 
 _stop = False
 
@@ -933,15 +937,16 @@ def run_rs485(args) -> int:
 
     transport = RS485Transport(
         port=args.port,
-        baudrate=args.baud if args.baud != UART_BAUDRATE else 9600,
-        parity=args.parity if args.parity != UART_PARITY else "N",
+        baudrate=args.baud,
+        parity=args.parity,
         timeout=args.read_timeout,
         address=args.address,
     )
 
-    print("RS485: ЗАГОТОВКА. Формат кадра не расшифрован, идёт сбор сырого дампа.")
+    print("RS485: пассивное прослушивание шины, разбор кадров 0x7E.")
     print("Параметры: %r" % transport)
     print("Если в линии тишина, переберите скорости: %s" % ", ".join(map(str, COMMON_BAUDRATES)))
+    print("Смысл регистров не расшифрован, они выводятся как индекс=значение.")
     print("Ctrl+C — остановка.\n")
 
     try:
@@ -952,38 +957,43 @@ def run_rs485(args) -> int:
 
     decoder = RS485Decoder()
     dump = open(args.dump, "ab") if args.dump else None
-    # пауза, после которой посылка считается законченной: как в Modbus RTU,
-    # 3,5 байтовых времени, но не короче 2 мс
-    gap = max(0.002, 3.5 * 10.0 / transport.baudrate)
     total = 0
-    last_rx = time.monotonic()
+    # кадры идут одинаковыми циклами, поэтому по умолчанию печатаем только
+    # новые и изменившиеся: иначе повторы заливают экран и настоящее
+    # изменение регистра в них теряется
+    seen = {}
 
     try:
         deadline = None if args.duration is None else time.monotonic() + args.duration
         while not _stop and (deadline is None or time.monotonic() < deadline):
             chunk = transport.read(256)
-            now = time.monotonic()
-            if chunk:
-                total += len(chunk)
-                decoder.feed(chunk)
-                if dump is not None:
-                    dump.write(chunk)
-                last_rx = now
-            else:
-                if now - last_rx > gap:
-                    for frame in decoder.flush():
-                        print("%s %s" % (time.strftime("%H:%M:%S"), frame.describe()))
+            if not chunk:
                 time.sleep(0.002)
+                continue
+            total += len(chunk)
+            if dump is not None:
+                dump.write(chunk)
+            for frame in decoder.feed(chunk):
+                # кадр опознаём по адресам, команде и индексу блока: тогда
+                # изменение значений регистров видно как изменение кадра
+                key = (frame.addr_a, frame.addr_b, frame.cmd, bytes(frame.payload[:2]))
+                if not args.verbose and seen.get(key) == frame.payload:
+                    continue
+                mark = "*" if key in seen else " "   # * — кадр изменился
+                seen[key] = frame.payload
+                print("%s%s %s" % (time.strftime("%H:%M:%S"), mark, frame.describe()))
     except TransportError as exc:
         print("Ошибка линии: %s" % exc, file=sys.stderr)
         return 2
     finally:
-        for frame in decoder.flush():
-            print("%s %s" % (time.strftime("%H:%M:%S"), frame.describe()))
+        decoder.flush()
         transport.close()
         if dump is not None:
             dump.close()
-        print("\nПринято %d байт, посылок: %d." % (total, decoder.frames_seen))
+        print("\nПринято %d байт, кадров: %d, битых CRC: %d, мусорных байт: %d."
+              % (total, decoder.frames_seen, decoder.bad_crc, decoder.dropped_bytes))
+        if not args.verbose:
+            print("Печатались только новые и изменившиеся кадры; -v — печатать все.")
 
     return 0
 
@@ -1007,12 +1017,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("-l", "--list", action="store_true", help="показать доступные порты и выйти")
     parser.add_argument("-p", "--port", help="порт, например COM6 или /dev/ttyUSB0")
-    parser.add_argument("-b", "--baud", type=int, default=UART_BAUDRATE, help="скорость (по умолчанию 4800)")
+    # ВАЖНО: значение по умолчанию именно None. Раньше здесь стояло 4800, а
+    # режим --rs485 отличал «пользователь не указал скорость» сравнением
+    # args.baud с 4800 — и потому молча съедал явное --baud 4800. Теперь
+    # умолчание подставляет сам режим, см. _apply_line_defaults().
+    parser.add_argument("-b", "--baud", type=int, default=None,
+                        help="скорость (по умолчанию %d, для --rs485 %d)"
+                             % (UART_BAUDRATE, RS485_BAUDRATE))
     parser.add_argument(
         "--parity",
-        default=UART_PARITY,
+        default=None,
         choices=["N", "E", "O", "M", "S"],
-        help="чётность (по умолчанию E, как требует протокол AUX)",
+        help="чётность (по умолчанию E, как требует протокол AUX; "
+             "для --rs485 N)",
     )
     parser.add_argument("--read-timeout", type=float, default=0.1, help="таймаут чтения порта, с")
 
@@ -1090,8 +1107,23 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _apply_line_defaults(args) -> None:
+    """Подставляет параметры линии по умолчанию для выбранного интерфейса.
+
+    Умолчания разные: интерфейс wifi-модуля работает на 4800/8-E-1 (так
+    требует протокол AUX), а шина RS485 — на 9600/8-N-1. Поэтому argparse
+    оставляет здесь None, а конкретное значение выбирается уже по режиму.
+    """
+    rs485 = args.rs485 or args.sniff_raw
+    if args.baud is None:
+        args.baud = RS485_BAUDRATE if rs485 else UART_BAUDRATE
+    if args.parity is None:
+        args.parity = RS485_PARITY if rs485 else UART_PARITY
+
+
 def main(argv: Optional[list] = None) -> int:
     args = build_parser().parse_args(argv)
+    _apply_line_defaults(args)
 
     # без этого предупреждения библиотеки (например, о теле пакета, которое не
     # укладывается в описанный формат) уходили бы в пустоту
