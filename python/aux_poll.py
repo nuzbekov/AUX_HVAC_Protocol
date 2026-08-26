@@ -20,6 +20,9 @@ wifi-модулем и сплитом и разбирает всё, что ви�
 
     python aux_poll.py --list                      список портов
     python aux_poll.py -p COM6 --loopback          проверка адаптера (перемычка TX-RX)
+    python aux_poll.py -p COM6 --status            прочитать текущий статус
+    python aux_poll.py -p COM6 --set --power on    одиночная команда
+    python aux_poll.py -p COM6 --set --byte 18=0x80  записать произвольный байт тела
     python aux_poll.py -p COM6                     пассивное прослушивание
     python aux_poll.py -p COM6 --active            активный опрос
     python aux_poll.py -p COM6 --json --log ac.jsonl
@@ -56,16 +59,25 @@ for _stream in (sys.stdout, sys.stderr):
 
 from aux_hvac import (  # noqa: E402
     AuxClient,
+    Command,
+    FanSpeed,
     IndoorState,
+    Mode,
     OutdoorState,
     Packet,
+    PacketType,
     RS485Transport,
     SerialTransport,
     StreamDecoder,
     TransportError,
+    VerticalLouver,
+    byte_names,
+    crc16_bytes,
+    decode_state,
     hexdump,
     list_ports,
     request_indoor,
+    request_outdoor,
 )
 from aux_hvac.const import UART_BAUDRATE, UART_PARITY  # noqa: E402
 
@@ -304,6 +316,163 @@ def run_aux(args) -> int:
     return 0
 
 
+_MODES = {m.name.lower(): m for m in Mode}
+_FANS = {f.name.lower(): f for f in FanSpeed}
+_LOUVERS = {v.name.lower(): v for v in VerticalLouver}
+
+
+def _ask(client, packet, want_cmd, timeout=5.0):
+    """Отправляет запрос и ждёт информационный ответ на него."""
+    client.decoder.reset()
+    client.transport.reset_input()
+    client.send(packet)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        for pkt in client.poll_once():
+            if pkt.ptype == PacketType.INFO and pkt.crc_ok and pkt.cmd == want_cmd:
+                return pkt
+        time.sleep(0.01)
+    return None
+
+
+def _print_state(indoor_pkt, outdoor_pkt):
+    if indoor_pkt is not None:
+        st = decode_state(indoor_pkt)
+        print("  %s" % st.describe())
+        print("  тело статуса: %s" % hexdump(st.payload))
+    if outdoor_pkt is not None:
+        print("  %s" % decode_state(outdoor_pkt).describe())
+
+
+def _print_diff(before, after, title):
+    """Печатает изменившиеся байты двух кадров одного типа."""
+    if before is None or after is None:
+        print("  %s: нет данных" % title)
+        return
+    names = byte_names(after)
+    rows = [
+        (8 + i, before.raw[8 + i], after.raw[8 + i])
+        for i in range(min(len(before.body), len(after.body)))
+        if before.raw[8 + i] != after.raw[8 + i]
+    ]
+    if not rows:
+        print("  %s: без изменений" % title)
+        return
+    print("  %s:" % title)
+    for idx, old, new in rows:
+        print("    байт %-2d %-9s 0x%02X -> 0x%02X   %s -> %s"
+              % (idx, names.get(idx, ""), old, new, format(old, "08b"), format(new, "08b")))
+
+
+def _parse_byte_spec(spec):
+    """Разбирает 'N=V': номер байта пакета (10..22) и значение."""
+    if "=" not in spec:
+        raise ValueError("ожидается вид N=V, например 18=0x80, получено %r" % spec)
+    left, right = spec.split("=", 1)
+    idx, val = int(left.strip(), 0), int(right.strip(), 0)
+    if not 10 <= idx <= 22:
+        raise ValueError("номер байта %d вне тела команды (допустимо 10..22)" % idx)
+    if not 0 <= val <= 0xFF:
+        raise ValueError("значение 0x%X не помещается в байт" % val)
+    return idx, val
+
+
+def _mutate(state, args):
+    """Применяет к состоянию всё, что задано ключами командной строки."""
+    changed = []
+    simple = (
+        ("power", state.set_power, lambda v: v == "on"),
+        ("mode", state.set_mode, lambda v: _MODES[v]),
+        ("fan", state.set_fan_speed, lambda v: _FANS[v]),
+        ("temp", state.set_target_temp, float),
+        ("louver", state.set_vertical_louver, lambda v: _LOUVERS[v]),
+        ("swing_lr", state.set_swing_lr, lambda v: v == "on"),
+        ("turbo", state.set_turbo, lambda v: v == "on"),
+        ("mute", state.set_mute, lambda v: v == "on"),
+        ("sleep", state.set_sleep, lambda v: v == "on"),
+        ("display", state.set_display, lambda v: v == "on"),
+        ("mildew", state.set_mildew, lambda v: v == "on"),
+        ("health", state.set_health, lambda v: v == "on"),
+        ("clean", state.set_clean, lambda v: v == "on"),
+    )
+    for name, setter, conv in simple:
+        value = getattr(args, name, None)
+        if value is not None:
+            setter(conv(value))
+            changed.append("%s=%s" % (name, value))
+    if args.power_limit is not None:
+        state.set_power_limit(None if args.power_limit < 0 else args.power_limit)
+        changed.append("power_limit=%s" % args.power_limit)
+    for spec in args.byte or []:
+        idx, val = _parse_byte_spec(spec)
+        state.payload[idx - 10] = val
+        changed.append("байт %d=0x%02X" % (idx, val))
+    return changed
+
+
+def run_command(args) -> int:
+    """Одиночная команда: прочитать статус, изменить, отправить, показать разницу."""
+    transport = SerialTransport(args.port, baudrate=args.baud, parity=args.parity,
+                                timeout=0.05)
+    client = AuxClient(transport, active=True, poll_interval=1e9)
+
+    try:
+        client.open()
+    except TransportError as exc:
+        print("Ошибка: %s" % exc, file=sys.stderr)
+        print("Список доступных портов: python aux_poll.py --list", file=sys.stderr)
+        return 2
+
+    try:
+        before_in = _ask(client, request_indoor(), Command.INDOOR)
+        before_out = _ask(client, request_outdoor(), Command.OUTDOOR)
+        if before_in is None:
+            print("Контроллер не ответил на запрос статуса.", file=sys.stderr)
+            return 1
+
+        print("СТАТУС:" if args.status else "БЫЛО:")
+        _print_state(before_in, before_out)
+
+        if args.status:
+            return 0
+
+        state = decode_state(before_in)
+        changed = _mutate(state, args)
+        if not changed:
+            print("\nНи один параметр не задан — менять нечего. "
+                  "Используйте --status для чтения.", file=sys.stderr)
+            return 2
+
+        cmd = state.to_command()
+        print("\nОТПРАВЛЯЮ: %s" % ", ".join(changed))
+        print("  кадр: %s" % hexdump(cmd.encode()))
+
+        ack = _ask(client, cmd, Command.CONTROL)
+        if ack is None:
+            print("  подтверждение CMD=0x01 не получено", file=sys.stderr)
+        else:
+            ours = crc16_bytes(cmd.encode()[:-2])
+            same = bytes(ack.body[2:4]) == ours
+            print("  подтверждение: %s (CRC команды %s)"
+                  % ("принято" if same else "CRC НЕ совпала", hexdump(ours)))
+
+        time.sleep(args.settle)
+        after_in = _ask(client, request_indoor(), Command.INDOOR)
+        after_out = _ask(client, request_outdoor(), Command.OUTDOOR)
+
+        print("\nСТАЛО:")
+        _print_state(after_in, after_out)
+        print()
+        _print_diff(before_in, after_in, "изменения внутреннего блока CMD=0x11")
+        _print_diff(before_out, after_out, "изменения внешнего блока  CMD=0x21")
+        return 0
+    except TransportError as exc:
+        print("Ошибка линии: %s" % exc, file=sys.stderr)
+        return 2
+    finally:
+        client.close()
+
+
 def run_loopback(args) -> int:
     """Проверка адаптера и настроек порта без кондиционера.
 
@@ -449,6 +618,12 @@ def run_rs485(args) -> int:
 #  CLI
 # ===========================================================================
 
+def _on_off(value: str) -> str:
+    if value not in ("on", "off"):
+        raise argparse.ArgumentTypeError("ожидается on или off, получено %r" % value)
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="aux_poll.py",
@@ -477,6 +652,34 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="проверить адаптер и порт: отправить кадр и дождаться эха (нужна перемычка TX-RX)",
     )
+
+    one = parser.add_argument_group(
+        "одиночные команды",
+        "прочитать статус, изменить заданное, отправить и показать разницу; "
+        "скрипт сразу завершается",
+    )
+    one.add_argument("--status", action="store_true", help="только прочитать и показать статус")
+    one.add_argument("--set", action="store_true", dest="set_mode_flag",
+                     help="отправить команду с параметрами ниже")
+    one.add_argument("--settle", type=float, default=2.0,
+                     help="пауза перед чтением результата, с (по умолчанию 2)")
+    one.add_argument("--power", type=_on_off, help="включить/выключить")
+    one.add_argument("--mode", choices=sorted(_MODES), help="режим работы")
+    one.add_argument("--fan", choices=sorted(_FANS), help="скорость вентилятора")
+    one.add_argument("--temp", type=float, help="целевая температура, шаг 0.5")
+    one.add_argument("--louver", choices=sorted(_LOUVERS), help="вертикальные шторки")
+    one.add_argument("--swing-lr", type=_on_off, help="качание влево-вправо")
+    one.add_argument("--turbo", type=_on_off, help="интенсивный режим")
+    one.add_argument("--mute", type=_on_off, help="тихий режим")
+    one.add_argument("--sleep", type=_on_off, help="ночной режим")
+    one.add_argument("--display", type=_on_off, help="дисплей")
+    one.add_argument("--mildew", type=_on_off, help="антиплесень")
+    one.add_argument("--health", type=_on_off, help="ионизатор HEALTH")
+    one.add_argument("--clean", type=_on_off, help="самоочистка iCLEAN")
+    one.add_argument("--power-limit", type=int,
+                     help="лимит мощности инвертора, %% (отрицательное — снять)")
+    one.add_argument("--byte", action="append", metavar="N=V",
+                     help="записать произвольный байт тела, 10..22; можно повторять")
 
     parser.add_argument(
         "-v",
@@ -527,6 +730,8 @@ def main(argv: Optional[list] = None) -> int:
     _install_sigint()
 
     try:
+        if args.status or args.set_mode_flag:
+            return run_command(args)
         if args.loopback:
             return run_loopback(args)
         if args.rs485 or args.sniff_raw:
