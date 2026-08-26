@@ -187,4 +187,5 @@ class HorizontalLouver(IntEnum):
 ERROR_CODES = {
     0x00: "нет ошибки",
     0x07: "E5: неисправность внешнего блока",
+    0x0E: "E4: нет обратной связи двигателя вентилятора (PG motor feedback)",
 }
