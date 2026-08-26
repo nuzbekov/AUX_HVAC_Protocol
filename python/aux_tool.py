@@ -51,6 +51,7 @@ from aux_hvac import (  # noqa: E402
     PacketError,
     StreamDecoder,
     VerticalLouver,
+    byte_names,
     control,
     crc16_bytes,
     decode_state,
@@ -425,9 +426,18 @@ def _packet_report(packet: Packet, as_json: bool = False, show_bits: bool = Fals
             )
     if show_bits:
         raw = packet.raw or packet.encode()
-        lines.append("      побайтно:")
+        names = byte_names(packet)
+        crc_at = len(raw) - 2
+        lines.append("      побайтно (имена байтов — по нумерации README):")
         for i, byte in enumerate(raw):
-            lines.append("        [%2d] 0x%02X  %s" % (i, byte, format(byte, "08b")))
+            if i >= crc_at:
+                name = "CRC%d" % (i - crc_at + 1)
+            else:
+                name = names.get(i, "")
+            lines.append(
+                "        [%2d] %-9s 0x%02X  %s  %3d"
+                % (i, name, byte, format(byte, "08b"), byte)
+            )
     return "\n".join(lines)
 
 

@@ -27,7 +27,13 @@ from .const import (
 )
 from .packet import Packet, PacketError
 
-__all__ = ["IndoorState", "OutdoorState", "decode_state", "enum_or_raw"]
+__all__ = [
+    "IndoorState",
+    "OutdoorState",
+    "decode_state",
+    "enum_or_raw",
+    "byte_names",
+]
 
 #: Смещение тела относительно начала пакета. Байт 8 пакета = body[0].
 _BODY_OFFSET = 8
@@ -737,6 +743,73 @@ class OutdoorState:
                 self.error_text,
             )
         )
+
+
+#: Имена байтов заголовка (README, «Заголовок»).
+_HEADER_NAMES = {
+    0: "START",
+    1: "?",
+    2: "TYPE",
+    3: "wifi?",
+    4: "?",
+    5: "?",
+    6: "LEN",
+    7: "?",
+}
+
+#: Имена байтов тела статуса внешнего блока (README, CMD=0x21).
+_OUTDOOR_NAMES = {
+    10: "CONF",
+    11: "MODE",
+    12: "FRST",
+    13: "FSPD",
+    14: "FPWM",
+    15: "Tint",
+    17: "To",
+    20: "oT",
+    22: "TCMP",
+    24: "iPwr",
+    29: "ERR",
+    31: "Tid",
+}
+
+#: Имена байтов тела статуса внутреннего блока (README, CMD=0x11).
+_INDOOR_NAMES = {
+    10: "TS",
+    11: "SL",
+    12: "Td+TMR",
+    13: "SP+TH",
+    14: "TB+MT+TM",
+    15: "MO",
+    18: "EN",
+    20: "FL",
+    21: "PWR_LIM",
+    22: "Tsd",
+}
+
+
+def byte_names(packet: Packet) -> Dict[int, str]:
+    """Возвращает имена байтов кадра по нумерации README.
+
+    Нужно для разбора техники, которая от описанных сплит-систем отличается:
+    видно, какой именно байт ведёт себя не так, как в описании. Байты без
+    известного имени в словарь не попадают.
+    """
+    names = dict(_HEADER_NAMES)
+    cmd = packet.cmd
+    if cmd is None:
+        return names
+
+    if packet.ptype == PacketType.CMD:
+        names[8], names[9] = "CMD", "?X"
+    else:
+        names[8], names[9] = "?X", "CMD"
+
+    if packet.ptype == PacketType.INFO and (cmd == Command.OUTDOOR or 0x20 <= cmd <= 0x2F):
+        names.update(_OUTDOOR_NAMES)
+    elif cmd in (Command.INDOOR, Command.CONTROL):
+        names.update(_INDOOR_NAMES)
+    return names
 
 
 def decode_state(packet: Packet):

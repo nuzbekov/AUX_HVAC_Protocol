@@ -46,7 +46,7 @@ from .packet import (
     request_outdoor,
     unknown_0b,
 )
-from .state import IndoorState, OutdoorState, decode_state
+from .state import IndoorState, OutdoorState, byte_names, decode_state
 from .client import AuxClient, ClientStats
 from .transport.base import LoopbackTransport, Transport, TransportError
 from .transport.uart import SerialTransport, list_ports
@@ -77,6 +77,7 @@ __all__ = [
     "IndoorState",
     "OutdoorState",
     "decode_state",
+    "byte_names",
     # перечисления
     "PacketType",
     "Command",
