@@ -689,24 +689,24 @@ def _monitor_rows(ind_state, out_state, ind_pkt, out_pkt):
     else:
         st = ind_state
         rows += [
-            ("v", "питание", _fmt_flag(st.power)),
-            ("v", "режим", _name_of(st.mode)),
-            ("v", "целевая температура", "%.1f °C" % st.target_temp),
-            ("v", "вентилятор задан", _name_of(st.fan_speed)),
-            ("v", "TURBO", _fmt_flag(st.turbo)),
-            ("v", "MUTE", _fmt_flag(st.mute)),
-            ("v", "SLEEP", _fmt_flag(st.sleep)),
-            ("v", "iFeel", _fmt_flag(st.ifeel)),
-            ("v", "шторки вертикальные", _name_of(st.vertical_louver)),
-            ("v", "качание лево-право", _fmt_flag(st.swing_lr)),
-            ("v", "дисплей (бит DS)", _fmt_flag(st.display)),
-            ("v", "антиплесень", _fmt_flag(st.mildew)),
-            ("v", "HEALTH", _fmt_flag(st.health)),
-            ("v", "таймер", "%s, %d ч %02d мин"
+            ("v", "питание (б.18 бит5 POW)", _fmt_flag(st.power)),
+            ("v", "режим (б.15 биты5-7 MD)", _name_of(st.mode)),
+            ("v", "цель (б.10 биты3-7, б.12 бит7)", "%.1f °C" % st.target_temp),
+            ("v", "вентилятор задан (б.13 биты5-7)", _name_of(st.fan_speed)),
+            ("v", "TURBO (б.14 бит6 TB)", _fmt_flag(st.turbo)),
+            ("v", "MUTE (б.14 бит7 MT)", _fmt_flag(st.mute)),
+            ("v", "SLEEP (б.15 бит2 SLP)", _fmt_flag(st.sleep)),
+            ("v", "iFeel (б.15 бит3 iFL)", _fmt_flag(st.ifeel)),
+            ("v", "шторки верт. (б.10 биты0-2)", _name_of(st.vertical_louver)),
+            ("v", "качание Л-П (б.11 биты5-7 LR)", _fmt_flag(st.swing_lr)),
+            ("v", "дисплей (б.20 бит4 DS)", _fmt_flag(st.display)),
+            ("v", "антиплесень (б.20 бит3 MD)", _fmt_flag(st.mildew)),
+            ("v", "HEALTH (б.18 бит1 HL2)", _fmt_flag(st.health)),
+            ("v", "таймер (б.18 бит6, б.13, б.14)", "%s, %d ч %02d мин"
                 % (_fmt_flag(st.timer_enabled), st.timer_hours, st.timer_minutes)),
-            ("v", "лимит мощности", ("%d %%" % st.power_limit)
+            ("v", "лимит мощности (б.21)", ("%d %%" % st.power_limit)
                 if st.power_limit_enabled else "снят"),
-            ("v", "минут с ИК-команды", "%d" % st.minutes_since_ir),
+            ("v", "минут с ИК-команды (б.12)", "%d" % st.minutes_since_ir),
             ("v", "тело статуса", hexdump(st.payload)),
         ]
 
@@ -718,17 +718,17 @@ def _monitor_rows(ind_state, out_state, ind_pkt, out_pkt):
         outdoor = "н/д" if st.outdoor_temp is None else "%.0f °C" % st.outdoor_temp
         compr = "н/д" if st.compressor_temp is None else "%.0f °C" % st.compressor_temp
         rows += [
-            ("v", "питание", _fmt_flag(st.power)),
-            ("v", "режим", _name_of(st.mode)),
+            ("v", "питание (б.11 бит0 PWR)", _fmt_flag(st.power)),
+            ("v", "режим (б.11 биты5-7 MD)", _name_of(st.mode)),
             ("v", "температура, байт 15+31", "%.1f °C" % st.indoor_temp),
             ("v", "теплообменник, байт 17", "%d  (%d °C по T-0x20)"
                 % (st.return_temp_raw, st.return_temp_hint)),
             ("v", "снаружи, байт 20", outdoor),
             ("v", "компрессор, байт 22", compr),
-            ("v", "скорость реальная", _name_of(st.real_fan_speed)),
+            ("v", "скорость реальная (б.13)", _name_of(st.real_fan_speed)),
             ("v", "ШИМ вентилятора", "%d" % st.fan_pwm),
-            ("v", "разморозка", _fmt_flag(st.defrost)),
-            ("v", "iCLEAN", _fmt_flag(st.clean)),
+            ("v", "разморозка (б.12 бит5 DF)", _fmt_flag(st.defrost)),
+            ("v", "iCLEAN (б.12 бит7 CL)", _fmt_flag(st.clean)),
             ("v", "мощность инвертора", "%d %%" % st.inverter_power),
             ("v", "ошибка", "0x%02X — %s" % (st.error_code, st.error_text)),
             ("v", "тело статуса", hexdump(st.payload)),
@@ -791,7 +791,7 @@ def run_monitor(args) -> int:
                     changed_at[key] = now
                 previous[key] = value
                 fresh = now - changed_at.get(key, 0.0) < 3.0
-                lines.append("  %-26s %-30s %s"
+                lines.append("  %-32s %-28s %s"
                              % (label, value, "<-- изменилось" if fresh else ""))
 
             lines.append("")
