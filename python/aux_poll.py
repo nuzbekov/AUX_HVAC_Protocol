@@ -751,9 +751,9 @@ def _monitor_rows(ind_state, out_state, ind_pkt, out_pkt):
         rows += [
             ("v", "питание (б.11 бит0 PWR)", _fmt_flag(st.power)),
             ("v", "режим (б.11 биты5-7 MD)", _name_of(st.mode)),
-            ("v", "температура, байт 15+31", "%.1f °C" % st.indoor_temp),
-            ("v", "теплообменник, байт 17", "%d  (%d °C по T-0x20)"
-                % (st.return_temp_raw, st.return_temp_hint)),
+            ("v", "температура возд., байт 15+31", "%.1f °C" % st.indoor_temp),
+            ("v", "теплообменник, байт 17", "%d °C  (сырое 0x%02X)"
+                % (st.return_temp_hint, st.return_temp_raw)),
             ("v", "снаружи, байт 20", outdoor),
             ("v", "компрессор, байт 22", compr),
             ("v", "скорость реальная (б.13)", _name_of(st.real_fan_speed)),
