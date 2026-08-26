@@ -508,6 +508,7 @@ def run_watch(args) -> int:
     print()
 
     prev = {}
+    ir_count = [0]
     deadline = None if args.duration is None else time.monotonic() + args.duration
     try:
         while not _stop and (deadline is None or time.monotonic() < deadline):
@@ -538,8 +539,10 @@ def run_watch(args) -> int:
                     was, now = old.raw[12] & 0x3F, pkt.raw[12] & 0x3F
                     ir = now < was
                 if ir:
-                    print("%s  <-- ПРИНЯТА КОМАНДА С ПУЛЬТА (счётчик минут байта 12 обнулён)"
-                          % time.strftime("%H:%M:%S"))
+                    ir_count[0] += 1
+                    print()
+                    print("%s  ===== ИК-КОМАНДА №%d ===== (счётчик минут байта 12 обнулён)"
+                          % (time.strftime("%H:%M:%S"), ir_count[0]))
                 for idx, name, a, b in rows:
                     print("%s  %s байт %-2d %-9s 0x%02X -> 0x%02X   %s -> %s"
                           % (time.strftime("%H:%M:%S"), label, idx, name, a, b,
@@ -554,6 +557,10 @@ def run_watch(args) -> int:
         return 2
     finally:
         client.close()
+        print()
+        print("Принято команд с пульта: %d." % ir_count[0])
+        if ir_count[0]:
+            print("Перечислите нажатые кнопки в том же порядке — номера совпадут.")
     return 0
 
 
