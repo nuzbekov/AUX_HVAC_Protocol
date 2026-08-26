@@ -368,6 +368,28 @@ def _print_diff(before, after, title):
               % (idx, names.get(idx, ""), old, new, format(old, "08b"), format(new, "08b")))
 
 
+def _parse_timer_spec(spec):
+    """Разбирает значение --timer: 'Ч:ММ' либо 'off'.
+
+    По README часы лежат в битах 0..4 байта 13 (максимум 23), минуты — в
+    битах 0..4 байта 14 (максимум 31), а сам таймер включается битом TMR
+    байта 18.
+    """
+    if spec.strip().lower() in ("off", "выкл", "0"):
+        return None
+    text = spec.replace(".", ":").strip()
+    if ":" not in text:
+        raise ValueError("ожидается вид Ч:ММ или off, получено %r" % spec)
+    hh, mm = text.split(":", 1)
+    hours, minutes = int(hh), int(mm)
+    if not 0 <= hours <= 23:
+        raise ValueError("часы таймера %d вне диапазона 0..23" % hours)
+    if not 0 <= minutes <= 31:
+        raise ValueError("минуты таймера %d вне диапазона 0..31 "
+                         "(в поле всего 5 бит)" % minutes)
+    return hours, minutes
+
+
 def _parse_byte_spec(spec):
     """Разбирает 'N=V': номер байта пакета (10..22) и значение."""
     if "=" not in spec:
@@ -407,6 +429,15 @@ def _mutate(state, args):
     if args.power_limit is not None:
         state.set_power_limit(None if args.power_limit < 0 else args.power_limit)
         changed.append("power_limit=%s" % args.power_limit)
+    if args.timer is not None:
+        parsed = _parse_timer_spec(args.timer)
+        if parsed is None:
+            state.set_timer(0, 0, enabled=False)
+            changed.append("таймер выключен")
+        else:
+            hours, minutes = parsed
+            state.set_timer(hours, minutes, enabled=True)
+            changed.append("таймер %d:%02d" % (hours, minutes))
     for spec in args.byte or []:
         idx, val = _parse_byte_spec(spec)
         state.payload[idx - 10] = val
@@ -1031,6 +1062,8 @@ def build_parser() -> argparse.ArgumentParser:
     one.add_argument("--mildew", type=_on_off, help="антиплесень")
     one.add_argument("--health", type=_on_off, help="ионизатор HEALTH")
     one.add_argument("--clean", type=_on_off, help="самоочистка iCLEAN")
+    one.add_argument("--timer", metavar="Ч:ММ",
+                     help="таймер: задержка вида 2:30 либо off; минуты не больше 31")
     one.add_argument("--power-limit", type=int,
                      help="лимит мощности инвертора, %% (отрицательное — снять)")
     one.add_argument("--byte", action="append", metavar="N=V",
