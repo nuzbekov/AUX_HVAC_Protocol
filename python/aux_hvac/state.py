@@ -245,6 +245,26 @@ class IndoorState:
         return bool(self.raw_en & 0x01)
 
     @property
+    def en_bit7(self) -> bool:
+        """Бит 7 байта 18 (EN). Назначение не расшифровано.
+
+        В описании протокола помечен как неиспользуемый, но на контроллере
+        фанкойла AUX это единственный свободный бит тела, который устройство
+        принимает и хранит — и только при сброшенном бите POW.
+
+        Установка бита зажигает на дисплее индикатор таймера — и при нулевой
+        задержке в байтах 13 и 14, и при заданной. Тот же индикатор зажигает и
+        бит TMR при включенном питании, так что для пользователя это одна
+        функция. Есть предположение, что бит 6 отвечает за таймер выключения,
+        а бит 7 — за таймер включения (он и хранится только при POW = 0), но
+        подтверждения этому пока нет.
+
+        Практическое следствие: при выключении таймера этот бит нужно сбросить
+        тоже, иначе индикатор может остаться горящим.
+        """
+        return bool(self.raw_en & 0x80)
+
+    @property
     def display(self) -> bool:
         """Бит DS байта 20 (FL).
 
@@ -383,8 +403,25 @@ class IndoorState:
             self.payload[11] = 0x80 | percent
         return self
 
+    def clear_timer(self) -> "IndoorState":
+        """Выключает таймер полностью.
+
+        Обнуляет задержку в байтах 13 и 14, снимает бит TMR и вместе с ним
+        бит 7 байта 18 (см. :attr:`en_bit7`): он не расшифрован, но связан с
+        индикатором таймера, и если его оставить, индикатор может продолжать
+        горсть при выключенном таймере.
+        """
+        self.set_timer(0, 0, enabled=False)
+        self.payload[8] &= ~0x80 & 0xFF
+        return self
+
     def set_timer(self, hours: int = 0, minutes: int = 0, enabled: bool = True) -> "IndoorState":
-        """Задаёт таймер: часы в байт 13, минуты в байт 14, флаг в байт 18."""
+        """Задаёт таймер: часы в байт 13, минуты в байт 14, флаг в байт 18.
+
+        ВАЖНО: с нулевой задержкой бит TMR не принимается — контроллер
+        сбрасывает его в ответном статусе. Чтобы выключить таймер, используйте
+        :meth:`clear_timer`.
+        """
         if not 0 <= hours <= 23:
             raise ValueError("часы таймера %s вне диапазона 0..23" % hours)
         if not 0 <= minutes <= 31:
@@ -438,6 +475,7 @@ class IndoorState:
             "timer_enabled": self.timer_enabled,
             "timer_hours": self.timer_hours,
             "timer_minutes": self.timer_minutes,
+            "en_bit7": self.en_bit7,
             "minutes_since_ir": self.minutes_since_ir,
             "power_limit_enabled": self.power_limit_enabled,
             "power_limit": self.power_limit,
@@ -447,7 +485,7 @@ class IndoorState:
     def describe(self) -> str:
         return (
             "внутренний блок: %s, режим %s, цель %.1f°C, вентилятор %s%s%s, "
-            "шторки V=%s LR=%s, дисплей %s, антиплесень %s"
+            "шторки V=%s LR=%s, дисплей %s, антиплесень %s, таймер %s"
             % (
                 "ВКЛ" if self.power else "выкл",
                 _name(self.mode),
@@ -459,8 +497,23 @@ class IndoorState:
                 "swing" if self.swing_lr else "off",
                 "вкл" if self.display else "выкл",
                 "вкл" if self.mildew else "выкл",
+                self.describe_timer(),
             )
         )
+
+    def describe_timer(self) -> str:
+        """Состояние таймера одной строкой, включая нерасшифрованный бит 7."""
+        if self.timer_enabled:
+            text = "%d:%02d" % (self.timer_hours, self.timer_minutes)
+        elif self.timer_hours or self.timer_minutes:
+            # флаг снят, но задержка в байтах 13 и 14 осталась
+            text = "выкл (задержка %d:%02d не сброшена)" % (
+                self.timer_hours, self.timer_minutes)
+        else:
+            text = "выкл"
+        if self.en_bit7:
+            text += ", бит7=1"
+        return text
 
 
 # ===========================================================================

@@ -432,8 +432,8 @@ def _mutate(state, args):
     if args.timer is not None:
         parsed = _parse_timer_spec(args.timer)
         if parsed is None:
-            state.set_timer(0, 0, enabled=False)
-            changed.append("таймер выключен")
+            state.clear_timer()
+            changed.append("таймер выключен полностью (задержка, бит TMR, бит 7)")
         else:
             hours, minutes = parsed
             state.set_timer(hours, minutes, enabled=True)
@@ -733,8 +733,8 @@ def _monitor_rows(ind_state, out_state, ind_pkt, out_pkt):
             ("v", "дисплей (б.20 бит4 DS)", _fmt_flag(st.display)),
             ("v", "антиплесень (б.20 бит3 MD)", _fmt_flag(st.mildew)),
             ("v", "HEALTH (б.18 бит1 HL2)", _fmt_flag(st.health)),
-            ("v", "таймер (б.18 бит6, б.13, б.14)", "%s, %d ч %02d мин"
-                % (_fmt_flag(st.timer_enabled), st.timer_hours, st.timer_minutes)),
+            ("v", "таймер (б.18 бит6, б.13, б.14)", st.describe_timer()),
+            ("v", "байт 18 бит7 (не расшифрован)", _fmt_flag(st.en_bit7, "1", "0")),
             ("v", "лимит мощности (б.21)", ("%d %%" % st.power_limit)
                 if st.power_limit_enabled else "снят"),
             ("v", "минут с ИК-команды (б.12)", "%d" % st.minutes_since_ir),
@@ -1063,7 +1063,9 @@ def build_parser() -> argparse.ArgumentParser:
     one.add_argument("--health", type=_on_off, help="ионизатор HEALTH")
     one.add_argument("--clean", type=_on_off, help="самоочистка iCLEAN")
     one.add_argument("--timer", metavar="Ч:ММ",
-                     help="таймер: задержка вида 2:30 либо off; минуты не больше 31")
+                     help="таймер: задержка вида 2:30 либо off. off сбрасывает и "
+                          "задержку, и бит TMR, и нерасшифрованный бит 7 байта 18, "
+                          "иначе индикатор таймера может остаться горящим")
     one.add_argument("--power-limit", type=int,
                      help="лимит мощности инвертора, %% (отрицательное — снять)")
     one.add_argument("--byte", action="append", metavar="N=V",
