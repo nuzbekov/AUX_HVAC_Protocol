@@ -388,5 +388,79 @@ class TestRS485Frame(unittest.TestCase):
             parse_status(frames[1])
 
 
+class TestRS485Monitor(unittest.TestCase):
+    """Панель мониторинга шины: она не должна выдавать догадки за показания."""
+
+    @staticmethod
+    def poll():
+        """Загружает aux_poll.py как модуль: это скрипт, а не пакет."""
+        import importlib.util
+        import os
+
+        path = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "aux_poll.py")
+        spec = importlib.util.spec_from_file_location("aux_poll_for_tests", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def rows(self, data):
+        from aux_hvac.rs485_protocol import RS485Decoder
+
+        ap = self.poll()
+        dec = RS485Decoder()
+        seen = {}
+        for frame in dec.feed(data):
+            key = (frame.addr_a, frame.addr_b, frame.cmd, bytes(frame.payload[:2]))
+            count = seen[key][2] + 1 if key in seen else 1
+            seen[key] = (frame, 0.0, count)
+        return ap._rs485_registers(seen)
+
+    def test_degrees_shown_only_where_they_mean_something(self):
+        """Ноль не должен становиться «0.0 °C», а 17 — «1.7 °C»."""
+        rows = self.rows(RS485_CYCLE)
+        values = {key: value for kind, key, _, value in rows if kind == "v"}
+
+        by_reg = {}
+        for kind, key, label, value in rows:
+            if kind == "v" and isinstance(key, tuple) and key[0][2] == 0x02:
+                by_reg[key[1]] = (label, value)
+
+        # расшифрованные регистры — с градусами
+        self.assertIn("°C", by_reg[10][1])
+        self.assertIn("°C", by_reg[13][1])
+        self.assertIn("ROOM", by_reg[10][0])
+        self.assertIn("PIPE", by_reg[13][0])
+        # нули и мелочь вроде 17 — без градусов, чтобы не врать
+        self.assertNotIn("°C", by_reg[9][1])
+        self.assertNotIn("°C", by_reg[3][1])
+        # и заведомо не-температуры тоже
+        self.assertNotIn("°C", by_reg[16][1])
+        self.assertTrue(values, "панель не собрала ни одной строки")
+
+    def test_same_register_number_in_different_frames_is_a_different_row(self):
+        """Регистр 13 у CMD=0x02 и у CMD=0x12 — разные строки, не одна.
+
+        Иначе отметка «изменилось» срабатывала бы на чужих значениях:
+        подписи вроде «регистр 13» повторяются в разных группах кадров.
+        """
+        rows = self.rows(RS485_CYCLE)
+        keys = [key for kind, key, _, _ in rows if kind == "v"]
+        self.assertEqual(len(keys), len(set(keys)), "ключи строк панели совпали")
+
+        reg13 = [key for key in keys if isinstance(key, tuple) and key[1] == 13]
+        self.assertGreater(len(reg13), 1)          # он есть в двух группах
+        self.assertEqual(len(set(reg13)), len(reg13))
+
+    def test_frames_without_registers_are_collapsed(self):
+        """Опросы сведены в один раздел, иначе панель не влезает в окно."""
+        rows = self.rows(RS485_CYCLE)
+        headers = [label for kind, _, label, _ in rows if kind == "h"]
+        self.assertEqual(
+            sum(1 for h in headers if "без блока регистров" in h), 1)
+        # разделов с регистрами столько, сколько разных блоков
+        self.assertEqual(sum(1 for h in headers if "регистры" in h), 5)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

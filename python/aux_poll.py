@@ -30,7 +30,9 @@ wifi-модулем и сплитом и разбирает всё, что ви�
     python aux_poll.py -p COM6 --json --log ac.jsonl
     python aux_poll.py -p COM6 --dump line.bin     сохранить сырой поток
     python aux_poll.py -p COM6 --send "BB 00 06 80 00 00 02 00 11 01 2B 7E"
-    python aux_poll.py -p COM6 --rs485 --dump rs485.bin  заготовка: дамп RS485-шины
+    python aux_poll.py -p COM6 --rs485                   слушать шину RS485
+    python aux_poll.py -p COM6 --rs485 --monitor         живая панель регистров шины
+    python aux_poll.py -p COM6 --rs485 --dump rs485.bin  дамп шины в файл
 
 Сырой дамп потом разбирается офлайн::
 
@@ -924,6 +926,170 @@ def run_loopback(args) -> int:
     return 1
 
 
+#: Диапазон, в котором подсказка «столько-то градусов» осмысленна.
+#:
+#: Печатать её для каждого регистра нельзя: ноль превратится в «0.0 °C», а
+#: значение 17 — в «1.7 °C», и панель начнёт выдавать догадки за показания.
+#: Поэтому для нерасшифрованных регистров подсказка появляется только внутри
+#: правдоподобного для датчика диапазона. Для расшифрованных — всегда.
+RS485_PLAUSIBLE_TEMP = (50, 1000)   # 5,0 .. 100,0 градуса
+
+
+def _rs485_value(block, cmd, reg, value):
+    """Значение регистра для панели: число и, если уместно, градусы."""
+    from aux_hvac.rs485_protocol import KNOWN_REGISTERS
+
+    temp = block.as_celsius(value)
+    known = (cmd, reg) in KNOWN_REGISTERS
+    low, high = RS485_PLAUSIBLE_TEMP
+    if temp is not None and (known or low <= abs(value) <= high):
+        return "%6d   %.1f °C" % (value, temp)
+    return "%6d" % value
+
+
+try:
+    from aux_hvac.rs485_protocol import KNOWN_REGISTERS as KNOWN_REGISTERS_CACHE
+except ImportError:                                   # pragma: no cover
+    KNOWN_REGISTERS_CACHE = {}
+
+
+def _rs485_registers(seen):
+    """Собирает строки панели из последних кадров каждого вида.
+
+    Кадры сгруппированы по адресам, команде и индексу блока: у каждой группы
+    свои регистры, и в панели они идут отдельными разделами. Расшифрованные
+    регистры подписываются.
+
+    Кадры без блока регистров (опросы и прочее) сведены в один компактный
+    раздел в конце по строке на вид. Иначе они занимают по разделу каждый, и
+    панель перестаёт влезать в окно — а интересное в ней как раз выше.
+
+    Возвращает строки вида (тип, ключ, подпись, значение). Ключ нужен, чтобы
+    отметка «изменилось» считалась внутри своей группы: подписи вроде
+    «регистр 11» повторяются в разных группах, и по одной подписи значения
+    разных кадров затирали бы друг друга.
+    """
+    rows, plain = [], []
+    for key in sorted(seen):
+        frame, stamp, count = seen[key]
+        tag = "%02X %02X cmd=%02X" % (frame.addr_a, frame.addr_b, frame.cmd)
+        block = frame.block
+        if block is None:
+            plain.append((key, tag, hexdump(frame.payload) or "пусто", count))
+            continue
+        rows.append(("h", None,
+                     "%s   регистры %d..%d   кадров %d   последний %s"
+                     % (tag, block.index, block.index + block.count - 1, count,
+                        time.strftime("%H:%M:%S", time.localtime(stamp))), ""))
+        for reg, value in block.items():
+            name = KNOWN_REGISTERS_CACHE.get((frame.cmd, reg))
+            label = ("регистр %d" % reg if name is None
+                     else "регистр %d — %s" % (reg, name))
+            rows.append(("v", (key, reg), label,
+                         _rs485_value(block, frame.cmd, reg, value)))
+
+    if plain:
+        rows.append(("h", None, "кадры без блока регистров", ""))
+        for key, tag, payload, count in plain:
+            rows.append(("v", (key, "raw"), "%s   кадров %d" % (tag, count), payload))
+    return rows
+
+
+def _rs485_monitor(args, transport) -> int:
+    """Живая панель шины RS485: перерисовка на месте, отметка изменений.
+
+    Шину только слушаем: на ней уже есть мастер, и опрашивать самим не нужно
+    и не стоит. Поэтому период обновления — это период перерисовки панели, а
+    не период опроса: кадры приходят сами, своим циклом.
+    """
+    from aux_hvac.rs485_protocol import RS485Decoder
+
+    decoder = RS485Decoder()
+    dump = open(args.dump, "ab") if args.dump else None
+
+    ansi = _enable_ansi()
+    screen = _Screen(ansi)
+    if not ansi:
+        print("Терминал не поддерживает ANSI: кадры будут идти друг за другом.")
+    screen.start()
+
+    seen = {}          # (адреса, команда, индекс блока) -> (кадр, время, счёт)
+    previous = {}
+    changed_at = {}
+    total = 0
+    started = time.monotonic()
+    deadline = None if args.duration is None else started + args.duration
+    next_draw = 0.0
+
+    try:
+        while not _stop and (deadline is None or time.monotonic() < deadline):
+            chunk = transport.read(256)
+            if chunk:
+                total += len(chunk)
+                if dump is not None:
+                    dump.write(chunk)
+                for frame in decoder.feed(chunk):
+                    key = (frame.addr_a, frame.addr_b, frame.cmd,
+                           bytes(frame.payload[:2]))
+                    count = seen[key][2] + 1 if key in seen else 1
+                    seen[key] = (frame, time.time(), count)
+
+            now = time.monotonic()
+            if now < next_draw:
+                if not chunk:
+                    time.sleep(0.002)
+                continue
+            next_draw = now + max(0.05, args.monitor_interval)
+
+            lines = [
+                "AUX RS485 — монитор   %s  %d/8-%s-1   %s   обновление %.1f с   "
+                "Ctrl+C — выход"
+                % (args.port, args.baud, args.parity, time.strftime("%H:%M:%S"),
+                   args.monitor_interval),
+                "",
+            ]
+            if not seen:
+                lines.append("  Пока ни одного кадра. Если в линии тишина —")
+                lines.append("  проверьте скорость и подключение A/B.")
+            for kind, key, label, value in _rs485_registers(seen):
+                if kind == "h":
+                    lines.append("")
+                    lines.append(label)
+                    lines.append("-" * 68)
+                    continue
+                mark = ""
+                if key in previous:
+                    if previous[key] != value:
+                        changed_at[key] = now
+                    if now - changed_at.get(key, 0.0) < 5.0:
+                        mark = "<-- изменилось"
+                previous[key] = value
+                lines.append("  %-40s %-18s %s" % (label, value, mark))
+
+            lines.append("")
+            lines.append("-" * 68)
+            lines.append("  принято %d байт, кадров %d, битых CRC %d, мусорных байт %d"
+                         % (total, decoder.frames_seen, decoder.bad_crc,
+                            decoder.dropped_bytes))
+            lines.append("  видов кадров: %d, работаем %.0f с"
+                         % (len(seen), now - started))
+            screen.draw(lines)
+    except TransportError as exc:
+        screen.stop()
+        print("Ошибка линии: %s" % exc, file=sys.stderr)
+        return 2
+    finally:
+        screen.stop()
+        decoder.flush()
+        transport.close()
+        if dump is not None:
+            dump.close()
+
+    print("Принято %d байт, кадров %d, битых CRC %d, мусорных байт %d."
+          % (total, decoder.frames_seen, decoder.bad_crc, decoder.dropped_bytes))
+    return 0
+
+
 def run_rs485(args) -> int:
     """ЗАГОТОВКА: снятие дампа RS485-шины.
 
@@ -954,6 +1120,9 @@ def run_rs485(args) -> int:
     except TransportError as exc:
         print("Ошибка: %s" % exc, file=sys.stderr)
         return 2
+
+    if args.monitor:
+        return _rs485_monitor(args, transport)
 
     decoder = RS485Decoder()
     dump = open(args.dump, "ab") if args.dump else None
@@ -1153,6 +1322,10 @@ def main(argv: Optional[list] = None) -> int:
     _install_sigint()
 
     try:
+        # --rs485 проверяем раньше --monitor: у шины своя панель, и общий
+        # монитор к ней не подходит — там нет ни опроса, ни статуса блока
+        if args.rs485 or args.sniff_raw:
+            return run_rs485(args)
         if args.monitor:
             return run_monitor(args)
         if args.watch:
@@ -1161,8 +1334,6 @@ def main(argv: Optional[list] = None) -> int:
             return run_command(args)
         if args.loopback:
             return run_loopback(args)
-        if args.rs485 or args.sniff_raw:
-            return run_rs485(args)
         return run_aux(args)
     except ValueError as exc:
         print("Ошибка: %s" % exc, file=sys.stderr)
