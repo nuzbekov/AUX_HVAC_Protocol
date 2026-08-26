@@ -58,24 +58,26 @@ class ClientStats:
         key = "0x%02X" % packet.ptype
         self.by_type[key] = self.by_type.get(key, 0) + 1
 
-    def describe(self) -> str:
+    def describe_lines(self):
+        """Счётчики двумя строками: принятое и всё остальное.
+
+        Одной строкой они не влезают в панель монитора: панель обрезает
+        содержимое по ширине окна, и хвост со счётчиком отправленного и
+        разбивкой по типам пропадал. Вторая строка начинается с мусорных байт.
+        """
         # без не-ASCII: сводку печатают и из чужих скриптов на консоли cp1251
         types = ", ".join("%s x%d" % (k, v) for k, v in sorted(self.by_type.items()))
-        return (
-            "принято пакетов: %d (битых CRC: %d, обрезанных: %d, с неразобранным "
-            "телом: %d), мусорных байт: %d, отправлено: %d (из них ответов на "
-            "ping: %d); по типам: %s"
-            % (
-                self.packets,
-                self.bad_crc,
-                self.truncated,
-                self.undecodable,
-                self.dropped_bytes,
-                self.sent,
-                self.pings_answered,
-                types or "нет",
-            )
-        )
+        return [
+            "принято пакетов: %d (битых CRC: %d, обрезанных: %d, "
+            "с неразобранным телом: %d)"
+            % (self.packets, self.bad_crc, self.truncated, self.undecodable),
+            "мусорных байт: %d, отправлено: %d (ping: %d); типы: %s"
+            % (self.dropped_bytes, self.sent, self.pings_answered, types or "нет"),
+        ]
+
+    def describe(self) -> str:
+        """Те же счётчики одной строкой — для итоговой сводки при выходе."""
+        return ", ".join(self.describe_lines())
 
 
 class AuxClient:

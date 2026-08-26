@@ -827,7 +827,8 @@ def run_monitor(args) -> int:
 
             lines.append("")
             lines.append("-" * 64)
-            lines.append("  %s" % client.stats.describe())
+            for row in client.stats.describe_lines():
+                lines.append("  %s" % row)
             screen.draw(lines)
 
             time.sleep(max(0.05, args.monitor_interval))
