@@ -45,6 +45,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import signal
 import sys
 import time
@@ -611,29 +612,68 @@ def _enable_ansi() -> bool:
 
 
 class _Screen:
-    """Перерисовывает кадр на том же месте, а не пишет его следом.
+    """Держит кадр на месте, используя альтернативный буфер экрана.
 
-    Курсор поднимается на высоту предыдущего кадра, каждая строка гасится
-    до конца перед печатью новой. Полная очистка экрана не используется —
-    она мигает. Если терминал ANSI не поддерживает, кадры просто идут
-    друг за другом.
+    Подъём курсора на высоту кадра работает только пока кадр целиком влезает
+    в окно. Стоит ему не влезть — терминал прокручивается, выше верхней
+    строки курсор поднять нельзя, и каждый следующий кадр печатается на
+    строку ниже: заголовок начинает дублироваться.
+
+    Поэтому берём альтернативный буфер, как это делают top и htop. Он ведёт
+    себя как окно фиксированного размера и не трогает основную прокрутку
+    терминала — по выходе пользователь видит ровно то, что было до запуска.
+    Кадр обрезается по размеру окна, чтобы прокрутки не возникало вовсе.
     """
 
     def __init__(self, ansi: bool) -> None:
         self.ansi = ansi
-        self.height = 0
+        self.entered = False
+        self.last = []
+
+    def start(self) -> None:
+        if not self.ansi:
+            return
+        # ?1049h — альтернативный буфер, ?25l — скрыть курсор
+        sys.stdout.write(_CSI + "?1049h" + _CSI + "?25l")
+        sys.stdout.flush()
+        self.entered = True
+
+    def stop(self) -> None:
+        if not self.entered:
+            return
+        sys.stdout.write(_CSI + "?25h" + _CSI + "?1049l")
+        sys.stdout.flush()
+        self.entered = False
 
     def draw(self, lines) -> None:
-        target = max(len(lines), self.height)
-        padded = list(lines) + [""] * (target - len(lines))
-        out = []
-        if self.ansi and self.height:
-            out.append(_CSI + "%dA" % self.height)
-        for line in padded:
-            out.append(line + (_CSI + "K" if self.ansi else "") + chr(10))
-        self.height = target
+        self.last = list(lines)
+        if not self.ansi:
+            sys.stdout.write(chr(10).join(lines) + chr(10) * 2)
+            sys.stdout.flush()
+            return
+
+        # get_terminal_size возвращает (columns, lines) — берём поля по
+        # именам, чтобы не перепутать ширину с высотой
+        size = shutil.get_terminal_size((80, 24))
+        rows, cols = size.lines, size.columns
+        body = list(lines)
+        if len(body) > rows - 1:
+            hidden = len(body) - (rows - 2)
+            body = body[: rows - 2]
+            body.append("  ... окно мало, скрыто строк: %d" % hidden)
+
+        out = [_CSI + "H"]                      # курсор в левый верхний угол
+        for line in body:
+            out.append(line[: max(1, cols - 1)] + _CSI + "K" + chr(10))
+        out.append(_CSI + "J")                  # погасить остаток экрана
         sys.stdout.write("".join(out))
         sys.stdout.flush()
+
+    def replay_last(self) -> None:
+        """Печатает последний кадр в обычный буфер, чтобы он остался на экране."""
+        if self.last:
+            sys.stdout.write(chr(10).join(self.last) + chr(10))
+            sys.stdout.flush()
 
 
 def _fmt_flag(value: bool, on: str = "ВКЛ", off: str = "выкл") -> str:
@@ -717,6 +757,7 @@ def run_monitor(args) -> int:
     screen = _Screen(ansi)
     if not ansi:
         print("Терминал не поддерживает ANSI: кадры будут идти друг за другом.")
+    screen.start()
 
     previous = {}
     changed_at = {}
@@ -764,6 +805,11 @@ def run_monitor(args) -> int:
         return 2
     finally:
         client.close()
+        screen.stop()
+        # альтернативный буфер по выходе исчезает вместе с панелью,
+        # поэтому последний кадр печатаем ещё раз в обычный
+        if ansi:
+            screen.replay_last()
         sys.stdout.write(chr(10))
         sys.stdout.flush()
     return 0
