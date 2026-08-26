@@ -22,6 +22,7 @@ wifi-модулем и сплитом и разбирает всё, что ви�
     python aux_poll.py -p COM6 --loopback          проверка адаптера (перемычка TX-RX)
     python aux_poll.py -p COM6 --status            прочитать текущий статус
     python aux_poll.py -p COM6 --watch             следить за изменениями (кнопки пульта)
+    python aux_poll.py -p COM6 --monitor           живая панель состояния
     python aux_poll.py -p COM6 --set --power on    одиночная команда
     python aux_poll.py -p COM6 --set --byte 18=0x80  записать произвольный байт тела
     python aux_poll.py -p COM6                     пассивное прослушивание
@@ -42,6 +43,7 @@ import argparse
 import binascii
 import json
 import logging
+import os
 import re
 import signal
 import sys
@@ -580,6 +582,193 @@ def run_watch(args) -> int:
     return 0
 
 
+#: Начало управляющей последовательности ANSI.
+_CSI = chr(27) + "["
+
+
+def _enable_ansi() -> bool:
+    """Включает обработку ANSI в консоли. Возвращает True, если можно рисовать.
+
+    В Windows виртуальный терминал в conhost по умолчанию выключен, и без
+    этого вызова управляющие последовательности печатались бы как мусор.
+    """
+    if not sys.stdout.isatty():
+        return False
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+        # 0x0004 — ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        return bool(kernel32.SetConsoleMode(handle, mode.value | 0x0004))
+    except Exception:
+        return False
+
+
+class _Screen:
+    """Перерисовывает кадр на том же месте, а не пишет его следом.
+
+    Курсор поднимается на высоту предыдущего кадра, каждая строка гасится
+    до конца перед печатью новой. Полная очистка экрана не используется —
+    она мигает. Если терминал ANSI не поддерживает, кадры просто идут
+    друг за другом.
+    """
+
+    def __init__(self, ansi: bool) -> None:
+        self.ansi = ansi
+        self.height = 0
+
+    def draw(self, lines) -> None:
+        target = max(len(lines), self.height)
+        padded = list(lines) + [""] * (target - len(lines))
+        out = []
+        if self.ansi and self.height:
+            out.append(_CSI + "%dA" % self.height)
+        for line in padded:
+            out.append(line + (_CSI + "K" if self.ansi else "") + chr(10))
+        self.height = target
+        sys.stdout.write("".join(out))
+        sys.stdout.flush()
+
+
+def _fmt_flag(value: bool, on: str = "ВКЛ", off: str = "выкл") -> str:
+    return on if value else off
+
+
+def _monitor_rows(ind_state, out_state, ind_pkt, out_pkt):
+    """Собирает панель как список строк. Порядок и состав фиксированы."""
+    rows = []
+    rows.append(("h", "ВНУТРЕННИЙ БЛОК (CMD=0x11)", ""))
+    if ind_state is None:
+        rows.append(("v", "статус", "нет ответа"))
+    else:
+        st = ind_state
+        rows += [
+            ("v", "питание", _fmt_flag(st.power)),
+            ("v", "режим", _name_of(st.mode)),
+            ("v", "целевая температура", "%.1f °C" % st.target_temp),
+            ("v", "вентилятор задан", _name_of(st.fan_speed)),
+            ("v", "TURBO", _fmt_flag(st.turbo)),
+            ("v", "MUTE", _fmt_flag(st.mute)),
+            ("v", "SLEEP", _fmt_flag(st.sleep)),
+            ("v", "iFeel", _fmt_flag(st.ifeel)),
+            ("v", "шторки вертикальные", _name_of(st.vertical_louver)),
+            ("v", "качание лево-право", _fmt_flag(st.swing_lr)),
+            ("v", "дисплей (бит DS)", _fmt_flag(st.display)),
+            ("v", "антиплесень", _fmt_flag(st.mildew)),
+            ("v", "HEALTH", _fmt_flag(st.health)),
+            ("v", "таймер", "%s, %d ч %02d мин"
+                % (_fmt_flag(st.timer_enabled), st.timer_hours, st.timer_minutes)),
+            ("v", "лимит мощности", ("%d %%" % st.power_limit)
+                if st.power_limit_enabled else "снят"),
+            ("v", "минут с ИК-команды", "%d" % st.minutes_since_ir),
+            ("v", "тело статуса", hexdump(st.payload)),
+        ]
+
+    rows.append(("h", "ВНЕШНИЙ БЛОК (CMD=0x21)", ""))
+    if out_state is None:
+        rows.append(("v", "статус", "нет ответа"))
+    else:
+        st = out_state
+        outdoor = "н/д" if st.outdoor_temp is None else "%.0f °C" % st.outdoor_temp
+        compr = "н/д" if st.compressor_temp is None else "%.0f °C" % st.compressor_temp
+        rows += [
+            ("v", "питание", _fmt_flag(st.power)),
+            ("v", "режим", _name_of(st.mode)),
+            ("v", "температура, байт 15+31", "%.1f °C" % st.indoor_temp),
+            ("v", "теплообменник, байт 17", "%d  (%d °C по T-0x20)"
+                % (st.return_temp_raw, st.return_temp_hint)),
+            ("v", "снаружи, байт 20", outdoor),
+            ("v", "компрессор, байт 22", compr),
+            ("v", "скорость реальная", _name_of(st.real_fan_speed)),
+            ("v", "ШИМ вентилятора", "%d" % st.fan_pwm),
+            ("v", "разморозка", _fmt_flag(st.defrost)),
+            ("v", "iCLEAN", _fmt_flag(st.clean)),
+            ("v", "мощность инвертора", "%d %%" % st.inverter_power),
+            ("v", "ошибка", "0x%02X — %s" % (st.error_code, st.error_text)),
+            ("v", "тело статуса", hexdump(st.payload)),
+        ]
+    return rows
+
+
+def _name_of(value):
+    return value.name if hasattr(value, "name") else "0x%02X" % value
+
+
+def run_monitor(args) -> int:
+    """Живая панель состояния: опрос по таймеру, перерисовка на месте."""
+    transport = SerialTransport(args.port, baudrate=args.baud, parity=args.parity,
+                                timeout=0.05)
+    client = AuxClient(transport, active=True, poll_interval=1e9)
+
+    try:
+        client.open()
+    except TransportError as exc:
+        print("Ошибка: %s" % exc, file=sys.stderr)
+        print("Список доступных портов: python aux_poll.py --list", file=sys.stderr)
+        return 2
+
+    ansi = _enable_ansi()
+    screen = _Screen(ansi)
+    if not ansi:
+        print("Терминал не поддерживает ANSI: кадры будут идти друг за другом.")
+
+    previous = {}
+    changed_at = {}
+    started = time.monotonic()
+    deadline = None if args.duration is None else started + args.duration
+
+    try:
+        while not _stop and (deadline is None or time.monotonic() < deadline):
+            ind = _ask(client, request_indoor(), Command.INDOOR, timeout=3.0)
+            out = _ask(client, request_outdoor(), Command.OUTDOOR, timeout=3.0)
+            ind_state = decode_state(ind) if ind is not None else None
+            out_state = decode_state(out) if out is not None else None
+
+            now = time.monotonic()
+            rows = _monitor_rows(ind_state, out_state, ind, out)
+
+            lines = [
+                "AUX HVAC — монитор   %s  %d/8-%s-1   %s   опрос %.1f с   Ctrl+C — выход"
+                % (args.port, args.baud, args.parity, time.strftime("%H:%M:%S"),
+                   args.monitor_interval),
+                "",
+            ]
+            for kind, label, value in rows:
+                if kind == "h":
+                    lines.append("")
+                    lines.append(label)
+                    lines.append("-" * 64)
+                    continue
+                key = "%s|%s" % (len(lines), label)
+                if key in previous and previous[key] != value:
+                    changed_at[key] = now
+                previous[key] = value
+                fresh = now - changed_at.get(key, 0.0) < 3.0
+                lines.append("  %-26s %-30s %s"
+                             % (label, value, "<-- изменилось" if fresh else ""))
+
+            lines.append("")
+            lines.append("-" * 64)
+            lines.append("  %s" % client.stats.describe())
+            screen.draw(lines)
+
+            time.sleep(max(0.05, args.monitor_interval))
+    except TransportError as exc:
+        print("Ошибка линии: %s" % exc, file=sys.stderr)
+        return 2
+    finally:
+        client.close()
+        sys.stdout.write(chr(10))
+        sys.stdout.flush()
+    return 0
+
+
 def run_loopback(args) -> int:
     """Проверка адаптера и настроек порта без кондиционера.
 
@@ -766,6 +955,10 @@ def build_parser() -> argparse.ArgumentParser:
         "скрипт сразу завершается",
     )
     one.add_argument("--status", action="store_true", help="только прочитать и показать статус")
+    one.add_argument("--monitor", action="store_true",
+                     help="живая панель состояния с перерисовкой на месте")
+    one.add_argument("--monitor-interval", type=float, default=1.0,
+                     help="период опроса в режиме --monitor, с (по умолчанию 1)")
     one.add_argument("--watch", action="store_true",
                      help="следить за статусом и печатать только изменения "
                           "(удобно для разбора кнопок ИК-пульта)")
@@ -846,6 +1039,8 @@ def main(argv: Optional[list] = None) -> int:
     _install_sigint()
 
     try:
+        if args.monitor:
+            return run_monitor(args)
         if args.watch:
             return run_watch(args)
         if args.status or args.set_mode_flag:
