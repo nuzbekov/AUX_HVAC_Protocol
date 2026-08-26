@@ -84,6 +84,10 @@ from aux_hvac import (  # noqa: E402
     request_outdoor,
 )
 from aux_hvac.const import UART_BAUDRATE, UART_PARITY  # noqa: E402
+from aux_hvac.transport.rs485 import (  # noqa: E402
+    RS485_BAUDRATE,
+    RS485_PARITY,
+)
 
 _stop = False
 
@@ -933,8 +937,8 @@ def run_rs485(args) -> int:
 
     transport = RS485Transport(
         port=args.port,
-        baudrate=args.baud if args.baud != UART_BAUDRATE else 9600,
-        parity=args.parity if args.parity != UART_PARITY else "N",
+        baudrate=args.baud,
+        parity=args.parity,
         timeout=args.read_timeout,
         address=args.address,
     )
@@ -1007,12 +1011,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("-l", "--list", action="store_true", help="показать доступные порты и выйти")
     parser.add_argument("-p", "--port", help="порт, например COM6 или /dev/ttyUSB0")
-    parser.add_argument("-b", "--baud", type=int, default=UART_BAUDRATE, help="скорость (по умолчанию 4800)")
+    # ВАЖНО: значение по умолчанию именно None. Раньше здесь стояло 4800, а
+    # режим --rs485 отличал «пользователь не указал скорость» сравнением
+    # args.baud с 4800 — и потому молча съедал явное --baud 4800. Теперь
+    # умолчание подставляет сам режим, см. _apply_line_defaults().
+    parser.add_argument("-b", "--baud", type=int, default=None,
+                        help="скорость (по умолчанию %d, для --rs485 %d)"
+                             % (UART_BAUDRATE, RS485_BAUDRATE))
     parser.add_argument(
         "--parity",
-        default=UART_PARITY,
+        default=None,
         choices=["N", "E", "O", "M", "S"],
-        help="чётность (по умолчанию E, как требует протокол AUX)",
+        help="чётность (по умолчанию E, как требует протокол AUX; "
+             "для --rs485 N)",
     )
     parser.add_argument("--read-timeout", type=float, default=0.1, help="таймаут чтения порта, с")
 
@@ -1090,8 +1101,23 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _apply_line_defaults(args) -> None:
+    """Подставляет параметры линии по умолчанию для выбранного интерфейса.
+
+    Умолчания разные: интерфейс wifi-модуля работает на 4800/8-E-1 (так
+    требует протокол AUX), а шина RS485 — на 9600/8-N-1. Поэтому argparse
+    оставляет здесь None, а конкретное значение выбирается уже по режиму.
+    """
+    rs485 = args.rs485 or args.sniff_raw
+    if args.baud is None:
+        args.baud = RS485_BAUDRATE if rs485 else UART_BAUDRATE
+    if args.parity is None:
+        args.parity = RS485_PARITY if rs485 else UART_PARITY
+
+
 def main(argv: Optional[list] = None) -> int:
     args = build_parser().parse_args(argv)
+    _apply_line_defaults(args)
 
     # без этого предупреждения библиотеки (например, о теле пакета, которое не
     # укладывается в описанный формат) уходили бы в пустоту
