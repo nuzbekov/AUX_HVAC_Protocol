@@ -115,6 +115,16 @@ class Reporter:
         stamp = time.strftime("%H:%M:%S")
         self._emit("%s %s" % (stamp, packet.describe()))
 
+    def on_send(self, packet: Packet) -> None:
+        """Отправленные кадры видно наравне с принятыми.
+
+        Без этого активный режим выглядит молчащим до первого ответа
+        кондиционера, и непонятно, ушёл запрос в линию или нет.
+        """
+        if self.args.json:
+            return
+        self._emit("%s %s" % (time.strftime("%H:%M:%S"), packet.describe()))
+
     def on_state(self, state, packet: Packet) -> None:
         stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
         if self.args.json:
@@ -128,6 +138,41 @@ class Reporter:
             self._emit(json.dumps(record, ensure_ascii=False))
         else:
             self._emit("         %s" % state.describe())
+
+
+_SILENCE_HINT = (
+    "Проверьте: тот ли порт (--list), не перепутаны ли TX и RX, "
+    "общая ли земля, подано ли питание на кондиционер, "
+    "верны ли скорость и чётность (протокол требует 4800/8-E-1)."
+)
+
+#: Через сколько секунд тишины в линии предупредить пользователя.
+_SILENCE_TIMEOUT = 15.0
+
+
+def _warn_if_silent(rx: dict, args) -> None:
+    """Печатает подсказку, если из линии давно ничего не приходило.
+
+    Без неё скрипт на неверном порту или неверной распайке выглядит просто
+    зависшим: он честно передаёт запросы, но ответов нет, и сказать об этом
+    некому.
+    """
+    now = time.monotonic()
+    if now - rx["last"] < _SILENCE_TIMEOUT or now - rx["warned"] < _SILENCE_TIMEOUT:
+        return
+    rx["warned"] = now
+    if rx["bytes"]:
+        print(
+            "В линии тишина уже %.0f с (всего принято %d байт)."
+            % (now - rx["last"], rx["bytes"]),
+            file=sys.stderr,
+        )
+    else:
+        print(
+            "Из линии не пришло ни одного байта за %.0f с. %s"
+            % (now - rx["last"], _SILENCE_HINT),
+            file=sys.stderr,
+        )
 
 
 # ===========================================================================
@@ -155,30 +200,46 @@ def run_aux(args) -> int:
         answer_ping=not args.no_ping,
         on_packet=reporter.on_packet,
         on_state=reporter.on_state,
+        on_send=reporter.on_send,
     )
+
+    # порт открываем до баннера, иначе сообщение об ошибке теряется в выводе
+    try:
+        client.open()
+    except TransportError as exc:
+        print("Ошибка: %s" % exc, file=sys.stderr)
+        print("Список доступных портов: python aux_poll.py --list", file=sys.stderr)
+        reporter.close()
+        return 2
 
     print("Порт %s: %d бод, %s, 8 бит, 1 стоп-бит." % (args.port, args.baud, args.parity))
     print("Режим: %s." % ("АКТИВНЫЙ (эмуляция wifi-модуля)" if args.active else "пассивный"))
     if args.active:
         print("Отключите штатный wifi-модуль от линии, иначе будут коллизии.")
+        print(
+            "Запрос статуса раз в %g с. Строки [=>] — что ушло в линию, "
+            "[<=] — что пришло." % args.interval
+        )
+    else:
+        print("Скрипт только слушает и ничего не передаёт. Если штатного "
+              "wifi-модуля на линии нет,")
+        print("кондиционер сам шлёт только ping раз в ~3 с — для запроса "
+              "статуса нужен --active.")
     print("Ctrl+C — остановка.\n")
 
-    try:
-        client.open()
-    except TransportError as exc:
-        print("Ошибка: %s" % exc, file=sys.stderr)
-        return 2
+    # перехватываем сырые байты: для --dump и для контроля тишины в линии
+    original_read = transport.read
+    rx = {"bytes": 0, "last": time.monotonic(), "warned": 0.0}
 
-    # перехватываем сырые байты для --dump, не трогая логику клиента
-    if reporter.dump is not None:
-        original_read = transport.read
-
-        def read_and_dump(size=256, timeout=None):
-            chunk = original_read(size, timeout)
+    def read_tracked(size=256, timeout=None):
+        chunk = original_read(size, timeout)
+        if chunk:
+            rx["bytes"] += len(chunk)
+            rx["last"] = time.monotonic()
             on_raw_chunk(chunk)
-            return chunk
+        return chunk
 
-        transport.read = read_and_dump  # type: ignore[assignment]
+    transport.read = read_tracked  # type: ignore[assignment]
 
     try:
         if args.send:
@@ -190,6 +251,7 @@ def run_aux(args) -> int:
         while not _stop and (deadline is None or time.monotonic() < deadline):
             if not client.poll_once():
                 time.sleep(0.02)
+            _warn_if_silent(rx, args)
     except TransportError as exc:
         print("Ошибка линии: %s" % exc, file=sys.stderr)
         return 2
@@ -200,6 +262,8 @@ def run_aux(args) -> int:
             print("Последний статус: %s" % client.indoor.describe())
         if client.outdoor is not None:
             print("Последний статус: %s" % client.outdoor.describe())
+        if rx["bytes"] == 0:
+            print("Из линии не пришло ни одного байта. " + _SILENCE_HINT)
         reporter.close()
 
     return 0

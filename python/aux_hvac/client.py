@@ -41,6 +41,7 @@ class ClientStats:
     """Счётчики для диагностики линии."""
 
     packets: int = 0
+    sent: int = 0
     bad_crc: int = 0
     truncated: int = 0
     dropped_bytes: int = 0
@@ -59,13 +60,14 @@ class ClientStats:
     def describe(self) -> str:
         types = ", ".join("%s×%d" % (k, v) for k, v in sorted(self.by_type.items()))
         return (
-            "пакетов: %d (битых CRC: %d, обрезанных: %d), мусорных байт: %d, "
-            "ответов на ping: %d; по типам: %s"
+            "принято пакетов: %d (битых CRC: %d, обрезанных: %d), мусорных байт: %d, "
+            "отправлено: %d (из них ответов на ping: %d); по типам: %s"
             % (
                 self.packets,
                 self.bad_crc,
                 self.truncated,
                 self.dropped_bytes,
+                self.sent,
                 self.pings_answered,
                 types or "нет",
             )
@@ -79,8 +81,9 @@ class AuxClient:
     :param active: изображать wifi-модуль (отвечать на ping, слать запросы).
     :param poll_interval: период запроса статусов в активном режиме, секунды.
     :param answer_ping: отвечать ли на дежурные пакеты кондиционера.
-    :param on_packet: колбэк на каждый разобранный кадр.
+    :param on_packet: колбэк на каждый принятый кадр.
     :param on_state: колбэк на каждое разобранное состояние блока.
+    :param on_send: колбэк на каждый отправленный кадр.
     """
 
     def __init__(
@@ -91,6 +94,7 @@ class AuxClient:
         answer_ping: bool = True,
         on_packet: Optional[Callable[[Packet], None]] = None,
         on_state: Optional[Callable[[object, Packet], None]] = None,
+        on_send: Optional[Callable[[Packet], None]] = None,
     ) -> None:
         self.transport = transport
         self.active = active
@@ -98,6 +102,7 @@ class AuxClient:
         self.answer_ping = answer_ping
         self.on_packet = on_packet
         self.on_state = on_state
+        self.on_send = on_send
 
         self.decoder = StreamDecoder()
         self.stats = ClientStats()
@@ -133,6 +138,9 @@ class AuxClient:
         raw = packet.encode()
         logger.debug("TX %s", packet.describe())
         self.transport.write(raw)
+        self.stats.sent += 1
+        if self.on_send is not None:
+            self.on_send(packet)
 
     def poll_once(self, read_size: int = 256) -> List[Packet]:
         """Один шаг цикла: прочитать линию, разобрать, при нужде ответить.
