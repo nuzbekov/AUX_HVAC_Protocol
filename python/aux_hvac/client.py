@@ -43,6 +43,7 @@ class ClientStats:
     packets: int = 0
     sent: int = 0
     bad_crc: int = 0
+    undecodable: int = 0
     truncated: int = 0
     dropped_bytes: int = 0
     pings_answered: int = 0
@@ -58,14 +59,17 @@ class ClientStats:
         self.by_type[key] = self.by_type.get(key, 0) + 1
 
     def describe(self) -> str:
-        types = ", ".join("%s×%d" % (k, v) for k, v in sorted(self.by_type.items()))
+        # без не-ASCII: сводку печатают и из чужих скриптов на консоли cp1251
+        types = ", ".join("%s x%d" % (k, v) for k, v in sorted(self.by_type.items()))
         return (
-            "принято пакетов: %d (битых CRC: %d, обрезанных: %d), мусорных байт: %d, "
-            "отправлено: %d (из них ответов на ping: %d); по типам: %s"
+            "принято пакетов: %d (битых CRC: %d, обрезанных: %d, с неразобранным "
+            "телом: %d), мусорных байт: %d, отправлено: %d (из них ответов на "
+            "ping: %d); по типам: %s"
             % (
                 self.packets,
                 self.bad_crc,
                 self.truncated,
+                self.undecodable,
                 self.dropped_bytes,
                 self.sent,
                 self.pings_answered,
@@ -184,7 +188,11 @@ class AuxClient:
             try:
                 state = decode_state(packet)
             except ValueError as exc:
-                logger.warning("не удалось разобрать тело пакета: %s", exc)
+                # CRC сошлась, значит кадр принят верно, а вот его тело не
+                # укладывается в описанный формат. Такое ждём на технике,
+                # отличной от сплит-систем, поэтому кадр показываем целиком.
+                self.stats.undecodable += 1
+                logger.warning("тело пакета не разобрано (%s): %s", exc, packet.describe())
 
         if isinstance(state, IndoorState):
             self.indoor = state

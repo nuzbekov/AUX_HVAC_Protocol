@@ -37,6 +37,7 @@ from __future__ import annotations
 import argparse
 import binascii
 import json
+import logging
 import re
 import signal
 import sys
@@ -477,6 +478,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="проверить адаптер и порт: отправить кадр и дождаться эха (нужна перемычка TX-RX)",
     )
 
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="подробный лог обмена; предупреждения о неразобранных телах видны и без него",
+    )
     parser.add_argument("--json", action="store_true", help="выводить состояния как JSON Lines")
     parser.add_argument("--log", help="дублировать вывод в файл")
     parser.add_argument("--dump", help="писать сырой поток в бинарный файл для offline-разбора")
@@ -491,6 +498,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[list] = None) -> int:
     args = build_parser().parse_args(argv)
+
+    # без этого предупреждения библиотеки (например, о теле пакета, которое не
+    # укладывается в описанный формат) уходили бы в пустоту
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.WARNING,
+        format="%(levelname)s %(name)s: %(message)s",
+        stream=sys.stderr,
+    )
 
     if args.list:
         try:
