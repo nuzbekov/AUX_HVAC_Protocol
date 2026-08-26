@@ -499,7 +499,8 @@ def run_watch(args) -> int:
         print("Список доступных портов: python aux_poll.py --list", file=sys.stderr)
         return 2
 
-    print("Слежение за статусом, порт %s, опрос раз в %g с." % (args.port, args.interval))
+    print("Слежение за статусом, порт %s, опрос раз в %g с."
+          % (args.port, args.watch_interval))
     print("Нажимайте кнопки пульта по одной — изменившиеся байты появятся здесь.")
     if not args.all:
         print("Байты 15, 17 и 31 (температуры) скрыты как шум, показать: --all")
@@ -547,7 +548,7 @@ def run_watch(args) -> int:
                     state = decode_state(pkt)
                     if state is not None:
                         print("             %s" % state.describe())
-            time.sleep(max(0.0, args.interval))
+            time.sleep(max(0.0, args.watch_interval))
     except TransportError as exc:
         print("Ошибка линии: %s" % exc, file=sys.stderr)
         return 2
@@ -745,6 +746,10 @@ def build_parser() -> argparse.ArgumentParser:
     one.add_argument("--watch", action="store_true",
                      help="следить за статусом и печатать только изменения "
                           "(удобно для разбора кнопок ИК-пульта)")
+    one.add_argument("--watch-interval", type=float, default=1.5,
+                     help="период опроса в режиме --watch, с (по умолчанию 1.5); "
+                          "общий --interval здесь не используется, он слишком "
+                          "крупный и нажатия слипаются в один замер")
     one.add_argument("--all", action="store_true",
                      help="в режиме --watch не скрывать байты температур")
     one.add_argument("--set", action="store_true", dest="set_mode_flag",
