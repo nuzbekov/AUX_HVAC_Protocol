@@ -21,6 +21,7 @@ wifi-модулем и сплитом и разбирает всё, что ви�
     python aux_poll.py --list                      список портов
     python aux_poll.py -p COM6 --loopback          проверка адаптера (перемычка TX-RX)
     python aux_poll.py -p COM6 --status            прочитать текущий статус
+    python aux_poll.py -p COM6 --watch             следить за изменениями (кнопки пульта)
     python aux_poll.py -p COM6 --set --power on    одиночная команда
     python aux_poll.py -p COM6 --set --byte 18=0x80  записать произвольный байт тела
     python aux_poll.py -p COM6                     пассивное прослушивание
@@ -473,6 +474,88 @@ def run_command(args) -> int:
         client.close()
 
 
+#: Байты, которые меняются сами по себе и в слежении только мешают.
+_NOISY = {15, 17, 31}
+
+
+def run_watch(args) -> int:
+    """Следит за статусом и печатает только изменившиеся байты.
+
+    Нужно, чтобы понять, что делает та или иная кнопка ИК-пульта: нажимаете
+    кнопку и сразу видите, какой бит поехал.
+
+    Отдельно отслеживается поле TMR байта 12 — счётчик минут с последней
+    команды пульта. Любая команда с пульта обнуляет его, так что по нему
+    видно сам факт приёма ИК-команды, даже если больше ничего не изменилось.
+    """
+    transport = SerialTransport(args.port, baudrate=args.baud, parity=args.parity,
+                                timeout=0.05)
+    client = AuxClient(transport, active=True, poll_interval=1e9)
+
+    try:
+        client.open()
+    except TransportError as exc:
+        print("Ошибка: %s" % exc, file=sys.stderr)
+        print("Список доступных портов: python aux_poll.py --list", file=sys.stderr)
+        return 2
+
+    print("Слежение за статусом, порт %s, опрос раз в %g с." % (args.port, args.interval))
+    print("Нажимайте кнопки пульта по одной — изменившиеся байты появятся здесь.")
+    if not args.all:
+        print("Байты 15, 17 и 31 (температуры) скрыты как шум, показать: --all")
+    print("Ctrl+C — остановка.")
+    print()
+
+    prev = {}
+    deadline = None if args.duration is None else time.monotonic() + args.duration
+    try:
+        while not _stop and (deadline is None or time.monotonic() < deadline):
+            for label, req, want in (("CMD=0x11", request_indoor(), Command.INDOOR),
+                                     ("CMD=0x21", request_outdoor(), Command.OUTDOOR)):
+                pkt = _ask(client, req, want, timeout=3.0)
+                if pkt is None:
+                    continue
+                old = prev.get(label)
+                prev[label] = pkt
+                if old is None:
+                    continue
+
+                names = byte_names(pkt)
+                rows = []
+                for i in range(min(len(old.body), len(pkt.body))):
+                    idx = 8 + i
+                    a, b = old.raw[idx], pkt.raw[idx]
+                    if a == b:
+                        continue
+                    if idx in _NOISY and not args.all:
+                        continue
+                    rows.append((idx, names.get(idx, ""), a, b))
+
+                # обнуление счётчика минут = пришла команда с пульта
+                ir = False
+                if label == "CMD=0x11" and len(pkt.body) > 4:
+                    was, now = old.raw[12] & 0x3F, pkt.raw[12] & 0x3F
+                    ir = now < was
+                if ir:
+                    print("%s  <-- ПРИНЯТА КОМАНДА С ПУЛЬТА (счётчик минут байта 12 обнулён)"
+                          % time.strftime("%H:%M:%S"))
+                for idx, name, a, b in rows:
+                    print("%s  %s байт %-2d %-9s 0x%02X -> 0x%02X   %s -> %s"
+                          % (time.strftime("%H:%M:%S"), label, idx, name, a, b,
+                             format(a, "08b"), format(b, "08b")))
+                if rows:
+                    state = decode_state(pkt)
+                    if state is not None:
+                        print("             %s" % state.describe())
+            time.sleep(max(0.0, args.interval))
+    except TransportError as exc:
+        print("Ошибка линии: %s" % exc, file=sys.stderr)
+        return 2
+    finally:
+        client.close()
+    return 0
+
+
 def run_loopback(args) -> int:
     """Проверка адаптера и настроек порта без кондиционера.
 
@@ -659,6 +742,11 @@ def build_parser() -> argparse.ArgumentParser:
         "скрипт сразу завершается",
     )
     one.add_argument("--status", action="store_true", help="только прочитать и показать статус")
+    one.add_argument("--watch", action="store_true",
+                     help="следить за статусом и печатать только изменения "
+                          "(удобно для разбора кнопок ИК-пульта)")
+    one.add_argument("--all", action="store_true",
+                     help="в режиме --watch не скрывать байты температур")
     one.add_argument("--set", action="store_true", dest="set_mode_flag",
                      help="отправить команду с параметрами ниже")
     one.add_argument("--settle", type=float, default=2.0,
@@ -730,6 +818,8 @@ def main(argv: Optional[list] = None) -> int:
     _install_sigint()
 
     try:
+        if args.watch:
+            return run_watch(args)
         if args.status or args.set_mode_flag:
             return run_command(args)
         if args.loopback:
