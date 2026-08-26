@@ -379,6 +379,70 @@ class TestRS485Frame(unittest.TestCase):
         self.assertNotIn("ROOM", other.describe())
         self.assertEqual(set(KNOWN_REGISTERS), {(0x02, 10), (0x02, 13)})
 
+    def test_bus_state_decodes_the_cmd01_frame(self):
+        """Кадр CMD=0x01 несёт состояние блока — разобрано сопоставлением с UART.
+
+        Значения сверены на живом железе: оба интерфейса одновременно давали
+        одно и то же, включая половину градуса в уставке.
+        """
+        from aux_hvac.const import FanSpeed, Mode
+        from aux_hvac.rs485_protocol import BusState, RS485Frame
+
+        # байт 0 = 0x92: питание (бит 7), режим COOL (001), вентилятор HIGH (001)
+        # байт 1 = 0x80: дисплей; байты 2..3 = 0x0104 = 260 = 26,0 градуса
+        frame = RS485Frame.decode(RS485Frame(
+            addr_a=0x01, addr_b=0xF1, cmd=0x01,
+            payload=bytes([0x92, 0x80, 0x01, 0x04, 0x00, 0x00])).encode())
+        self.assertTrue(frame.crc_ok)
+
+        state = BusState().update(frame)
+        self.assertIs(state.power, True)
+        self.assertEqual(state.mode, Mode.COOL)
+        self.assertEqual(state.fan_speed, FanSpeed.HIGH)
+        self.assertIs(state.display, True)
+        self.assertAlmostEqual(state.target_temp, 26.0)
+        self.assertIn("режим COOL", state.describe())
+        self.assertIn("вентилятор HIGH", state.describe())
+
+    def test_bus_state_keeps_halves_of_a_degree(self):
+        """Уставка 27,5 должна дойти без потерь: на шине это 275 десятых."""
+        from aux_hvac.rs485_protocol import BusState, RS485Frame
+
+        frame = RS485Frame.decode(RS485Frame(
+            addr_a=0x01, addr_b=0xF1, cmd=0x01,
+            payload=bytes([0x92, 0x80, 0x01, 0x13, 0x00, 0x00])).encode())
+        self.assertAlmostEqual(BusState().update(frame).target_temp, 27.5)
+
+    def test_bus_state_fills_only_what_the_frame_carries(self):
+        """Величина, которой в кадре не было, обязана остаться неизвестной.
+
+        Иначе «выключено» не отличить от «ещё не приходило».
+        """
+        from aux_hvac.rs485_protocol import BusState
+
+        frames, _ = self.frames()
+        state = BusState()
+        big = [f for f in frames if f.cmd == 0x02][0]
+        state.update(big)
+        self.assertAlmostEqual(state.room_temp, 25.0)
+        self.assertAlmostEqual(state.pipe_temp, 24.7)
+        self.assertIsNone(state.power)          # питания в этом кадре нет
+        self.assertIsNone(state.target_temp)
+        self.assertIn("н/д", state.describe())
+
+    def test_bus_state_ignores_broken_frames(self):
+        """Кадр с несошедшейся CRC не должен портить состояние."""
+        from aux_hvac.rs485_protocol import BusState, RS485Frame
+
+        good = RS485Frame(addr_a=0x01, addr_b=0xF1, cmd=0x01,
+                          payload=bytes([0x92, 0x80, 0x01, 0x04, 0x00, 0x00]))
+        state = BusState().update(RS485Frame.decode(good.encode()))
+        broken = bytearray(good.encode())
+        broken[5] ^= 0xFF                       # портим байт состояния
+        state.update(RS485Frame.decode(bytes(broken)))
+        self.assertIs(state.power, True)         # осталось прежним
+        self.assertAlmostEqual(state.target_temp, 26.0)
+
     def test_semantics_still_refuse_to_guess(self):
         """Смысл регистров не расшифрован — parse_status обязан это сказать."""
         from aux_hvac.rs485_protocol import NotDecodedYet, parse_status
@@ -386,6 +450,183 @@ class TestRS485Frame(unittest.TestCase):
         frames, _ = self.frames()
         with self.assertRaises(NotDecodedYet):
             parse_status(frames[1])
+
+
+class TestCorrelator(unittest.TestCase):
+    """Сопоставление регистров шины с полями UART.
+
+    Главное требование к нему — не выдавать случайные совпадения за
+    расшифровку: неверно подписанный регистр хуже неподписанного, потому что
+    его перестают проверять.
+    """
+
+    ROOMS = [24.7, 25.3, 27.1, 31.4, 22.2, 26.8, 29.9, 24.0]
+
+    def outdoor(self, room, outdoor=18):
+        """Большой статус UART с заданной комнатной температурой."""
+        from aux_hvac.state import OutdoorState
+
+        state = OutdoorState(payload=bytearray(24))
+        state.payload[5] = (int(room) + 0x20) & 0xFF        # байт 15
+        state.payload[21] = round((room - int(room)) * 10)  # байт 31
+        state.payload[10] = (outdoor + 0x20) & 0xFF         # байт 20
+        return state
+
+    def test_finds_a_real_relation_with_its_scale(self):
+        """Регистр, повторяющий поле в десятых долях, должен найтись."""
+        from aux_hvac.correlate import Correlator
+
+        corr = Correlator()
+        for n, room in enumerate(self.ROOMS):
+            corr.add_uart(n, self.outdoor(room))
+            corr.add_registers(n, 0x02, 13, [round(room * 10)])
+
+        found = corr.matches()
+        hit = [m for m in found if m.field == "indoor_temp"]
+        self.assertTrue(hit, "настоящая связь не найдена")
+        self.assertEqual((hit[0].cmd, hit[0].reg, hit[0].scale), (0x02, 13, 10))
+        self.assertAlmostEqual(hit[0].agreement, 1.0)
+
+    def test_constant_register_is_never_matched(self):
+        """С постоянным регистром совпадёт что угодно — значит, ничего."""
+        from aux_hvac.correlate import Correlator
+
+        corr = Correlator()
+        for n, room in enumerate(self.ROOMS):
+            corr.add_uart(n, self.outdoor(room))
+            corr.add_registers(n, 0x02, 20, [777])
+        self.assertEqual(corr.matches(), [])
+        self.assertNotIn((0x02, 20), corr.moved_registers())
+
+    def test_noisy_register_is_not_matched(self):
+        """Регистр, живущий своей жизнью, сопоставляться не должен."""
+        from aux_hvac.correlate import Correlator
+
+        corr = Correlator()
+        for n, room in enumerate(self.ROOMS):
+            corr.add_uart(n, self.outdoor(room))
+            corr.add_registers(n, 0x02, 21, [n * 3 + 1])
+        self.assertEqual([m for m in corr.matches() if m.reg == 21], [])
+
+    def test_field_that_never_moved_is_not_matched(self):
+        """Постоянное поле тоже не даёт права на вывод."""
+        from aux_hvac.correlate import Correlator
+
+        corr = Correlator()
+        for n, room in enumerate(self.ROOMS):
+            corr.add_uart(n, self.outdoor(room, outdoor=18))   # внешняя не меняется
+            corr.add_registers(n, 0x02, 13, [round(room * 10)])
+        self.assertNotIn("outdoor_temp", corr.moved_fields())
+        self.assertEqual([m for m in corr.matches() if m.field == "outdoor_temp"], [])
+
+    def test_registers_of_different_frames_do_not_collide(self):
+        """Регистр 13 у CMD=0x02 и у CMD=0x12 — разные величины.
+
+        Номера регистров у разных команд перекрываются, и если ключом взять
+        только номер, значения одного кадра затрут другой.
+        """
+        from aux_hvac.correlate import Correlator
+
+        corr = Correlator()
+        for n, room in enumerate(self.ROOMS):
+            corr.add_uart(n, self.outdoor(room))
+            corr.add_registers(n, 0x02, 13, [round(room * 10)])
+            corr.add_registers(n, 0x12, 13, [0])          # тёзка, но всегда ноль
+        keys = set(corr.moved_registers())
+        self.assertIn((0x02, 13), keys)
+        self.assertNotIn((0x12, 13), keys)
+
+    def test_no_verdict_without_uart_status(self):
+        """Пока статуса UART не было, регистры сопоставлять не с чем."""
+        from aux_hvac.correlate import Correlator
+
+        corr = Correlator()
+        self.assertFalse(corr.add_registers(0.0, 0x02, 13, [247]))
+        self.assertEqual(corr.samples, [])
+        self.assertIn("слишком мало", chr(10).join(corr.report_lines()))
+
+    def test_report_says_what_to_do_when_nothing_moved(self):
+        """Отчёт обязан подсказать, что опыт не дал данных, а не молчать.
+
+        Именно этот случай легко спутать с «мало данных»: снимков пришло
+        много, но все они одинаковые, потому что за сессию ничего не
+        изменилось. Отчёт должен говорить второе, а не первое.
+        """
+        from aux_hvac.correlate import Correlator
+
+        corr = Correlator()
+        for n in range(6):
+            corr.add_uart(n, self.outdoor(25.0))
+            corr.add_registers(n, 0x02, 13, [250])
+        self.assertEqual(corr.raw_samples, 6)
+        self.assertEqual(len(corr.samples), 1)      # повторы схлопнулись
+        text = chr(10).join(corr.report_lines())
+        self.assertIn("Все снимки одинаковые", text)
+        self.assertNotIn("слишком мало", text)
+
+    def test_repeated_identical_samples_do_not_inflate_confidence(self):
+        """Повтор одного и того же снимка не должен добавлять уверенности.
+
+        Шина повторяет цикл, и без схлопывания получалось бы «совпало 100%
+        из 2000 снимков» там, где разных состояний было пять.
+        """
+        from aux_hvac.correlate import Correlator
+
+        corr = Correlator()
+        for room in self.ROOMS:
+            corr.add_uart(0, self.outdoor(room))
+            for _ in range(50):                      # шина повторяет цикл
+                corr.add_registers(0, 0x02, 13, [round(room * 10)])
+        self.assertEqual(corr.raw_samples, len(self.ROOMS) * 50)
+        self.assertEqual(len(corr.samples), len(self.ROOMS))
+        hit = [m for m in corr.matches() if m.field == "indoor_temp"]
+        self.assertTrue(hit)
+        self.assertEqual(hit[0].samples, len(self.ROOMS))
+
+    def test_packed_bitfields_are_found(self):
+        """Питание и режим на шине упакованы в один байт — их надо находить.
+
+        Целиком такой байт ни с чем не совпадёт, и именно поэтому первая
+        версия коррелятора пропускала и питание, и дисплей, и режим.
+        """
+        from aux_hvac.correlate import Correlator
+
+        class Fake:
+            """Состояние с нужными полями: проверяем коррелятор, а не декодер."""
+
+            def __init__(self, power, mode):
+                self._d = {"power": bool(power), "mode": mode}
+
+            def to_dict(self):
+                return dict(self._d)
+
+        corr = Correlator()
+        # байт вида: бит 7 — питание, биты 6..4 — режим
+        for n, (power, mode) in enumerate([(1, 1), (1, 4), (0, 4), (1, 6),
+                                          (0, 1), (1, 0), (0, 0), (1, 2)]):
+            corr.add_uart(n, Fake(power, mode))
+            corr.add_registers(n, 0x01, 0, [(power << 7) | (mode << 4)])
+
+        found = corr.matches()
+        power_hit = [m for m in found if m.field == "power"]
+        self.assertTrue(power_hit, "битовое поле питания не найдено")
+        self.assertEqual((power_hit[0].shift, power_hit[0].width), (7, 1))
+        self.assertIn("бит 7", power_hit[0].place)
+
+        mode_hit = [m for m in found if m.field == "mode"]
+        self.assertTrue(mode_hit, "битовое поле режима не найдено")
+        self.assertEqual((mode_hit[0].shift, mode_hit[0].width), (4, 3))
+        self.assertIn("биты 6..4", mode_hit[0].place)
+
+    def test_text_fields_are_dropped(self):
+        """Текстовые поля вроде расшифровки ошибки числами не считаются."""
+        from aux_hvac.correlate import numeric_fields
+
+        fields = numeric_fields(self.outdoor(25.0))
+        self.assertIn("indoor_temp", fields)
+        self.assertNotIn("error_text", fields)
+        for name, value in fields.items():
+            self.assertIsInstance(value, float, name)
 
 
 class TestRS485Monitor(unittest.TestCase):

@@ -56,6 +56,32 @@
 регистре 7, судя по всему, означает «датчик не подключён»: на стенде часть
 датчиков действительно не подключена.
 
+Кадр ``CMD=0x01``: состояние блока
+==================================
+
+Этот кадр под модель «индекс, количество» не подходит, и поначалу его
+выбрасывали целиком. Оказалось, что в нём и лежит состояние блока —
+разобрано сопоставлением с UART (см. :mod:`aux_hvac.correlate`) и собрано в
+:class:`BusState`::
+
+    байт 0   бит 7      питание
+             биты 6..4  режим, коды как в UART (:class:`aux_hvac.const.Mode`)
+             биты 3..1  скорость вентилятора (:class:`~aux_hvac.const.FanSpeed`)
+             бит 0      всегда 0
+    байт 1   бит 7      дисплей
+    байты 2..3          уставка, десятые доли градуса, big-endian
+    байты 4..5          не расшифровано: принимает 0 и 5
+
+Замечательно тут то, что **коды режима и скорости те же, что в
+UART-протоколе**, только сдвинуты на один бит: в UART они занимают биты 7..5
+своих байтов, здесь — 6..4 и 3..1. Поэтому перечисления
+:class:`~aux_hvac.const.Mode` и :class:`~aux_hvac.const.FanSpeed`
+переиспользуются как есть.
+
+Проверка: байт `0x92` = питание включено, режим `001` = COOL, скорость
+`001` = HIGH — и UART в тот же момент показывал ровно «вкл, режим COOL,
+вентилятор HIGH».
+
 Два регистра кадра ``CMD=0x02`` расшифрованы опытом, см.
 :data:`KNOWN_REGISTERS`:
 
@@ -160,6 +186,7 @@ __all__ = [
     "KNOWN_ADDRESSES",
     "SENSOR_ABSENT",
     "KNOWN_REGISTERS",
+    "BusState",
     "NotDecodedYet",
 ]
 
@@ -296,6 +323,82 @@ class RegisterBlock:
             parts.append(text)
         return "рег %d..%d: %s" % (
             self.index, self.index + self.count - 1, ", ".join(parts))
+
+
+@dataclass
+class BusState:
+    """Состояние блока, собранное из кадров шины RS485.
+
+    Заполняется по мере прихода кадров: :meth:`update` берёт из каждого то,
+    что в нём расшифровано, и не трогает остальное. Поля, которых в пришедших
+    кадрах не было, остаются ``None`` — так видно разницу между «выключено» и
+    «неизвестно».
+
+    Умышленно не притворяется полным состоянием: расшифровано пока пять
+    величин из кадра ``CMD=0x01`` и две температуры из ``CMD=0x02``.
+    """
+
+    power: Optional[bool] = None
+    mode: Optional[int] = None
+    """Режим. Коды совпадают с :class:`aux_hvac.const.Mode`."""
+
+    fan_speed: Optional[int] = None
+    """Заданная скорость. Коды совпадают с :class:`aux_hvac.const.FanSpeed`."""
+
+    display: Optional[bool] = None
+    target_temp: Optional[float] = None
+    """Уставка, градусы."""
+
+    room_temp: Optional[float] = None
+    """Датчик ROOM, градусы."""
+
+    pipe_temp: Optional[float] = None
+    """Датчик PIPE (теплообменник), градусы."""
+
+    def update(self, frame: "RS485Frame") -> "BusState":
+        """Достаёт из кадра всё расшифрованное. Нерасшифрованное не трогает."""
+        if not frame.crc_ok:
+            return self
+        if frame.cmd == 0x01 and len(frame.payload) >= 4:
+            first = frame.payload[0]
+            self.power = bool(first & 0x80)
+            self.mode = (first >> 4) & 0x07
+            self.fan_speed = (first >> 1) & 0x07
+            self.display = bool(frame.payload[1] & 0x80)
+            self.target_temp = int.from_bytes(
+                frame.payload[2:4], "big", signed=True) / 10.0
+        elif frame.cmd == 0x02:
+            block = frame.block
+            if block is not None:
+                values = dict(block.items())
+                if 10 in values:
+                    self.room_temp = values[10] / 10.0
+                if 13 in values:
+                    self.pipe_temp = values[13] / 10.0
+        return self
+
+    def describe(self) -> str:
+        from .const import FanSpeed, Mode
+
+        def enum_name(enum_cls, code):
+            if code is None:
+                return "н/д"
+            try:
+                return enum_cls(code).name
+            except ValueError:
+                return "0x%02X" % code
+
+        def temp(value):
+            return "н/д" if value is None else "%.1f°C" % value
+
+        power = "н/д" if self.power is None else ("вкл" if self.power else "выкл")
+        display = "н/д" if self.display is None else ("вкл" if self.display else "выкл")
+        return ("шина: %s, режим %s, вентилятор %s, уставка %s, "
+                "дисплей %s, ROOM %s, PIPE %s"
+                % (power, enum_name(Mode, self.mode),
+                   enum_name(FanSpeed, self.fan_speed),
+                   temp(self.target_temp), display,
+                   temp(self.room_temp), temp(self.pipe_temp)))
 
 
 @dataclass

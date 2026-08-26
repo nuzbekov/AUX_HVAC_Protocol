@@ -30,6 +30,11 @@ wifi-модулем и сплитом и разбирает всё, что ви�
     python aux_poll.py -p COM6 --json --log ac.jsonl
     python aux_poll.py -p COM6 --dump line.bin     сохранить сырой поток
     python aux_poll.py -p COM6 --send "BB 00 06 80 00 00 02 00 11 01 2B 7E"
+    python aux_poll.py --sweep -p COM6 --rs485-port COM9
+                                                        активный проход по величинам
+    python aux_poll.py --correlate -p COM6 --rs485-port COM9
+                                                        сопоставить регистры шины
+                                                        с полями UART
     python aux_poll.py -p COM6 --rs485                   слушать шину RS485
     python aux_poll.py -p COM6 --rs485 --monitor         живая панель регистров шины
     python aux_poll.py -p COM6 --rs485 --dump rs485.bin  дамп шины в файл
@@ -1002,9 +1007,10 @@ def _rs485_monitor(args, transport) -> int:
     и не стоит. Поэтому период обновления — это период перерисовки панели, а
     не период опроса: кадры приходят сами, своим циклом.
     """
-    from aux_hvac.rs485_protocol import RS485Decoder
+    from aux_hvac.rs485_protocol import BusState, RS485Decoder
 
     decoder = RS485Decoder()
+    state = BusState()
     dump = open(args.dump, "ab") if args.dump else None
 
     ansi = _enable_ansi()
@@ -1029,6 +1035,7 @@ def _rs485_monitor(args, transport) -> int:
                 if dump is not None:
                     dump.write(chunk)
                 for frame in decoder.feed(chunk):
+                    state.update(frame)
                     key = (frame.addr_a, frame.addr_b, frame.cmd,
                            bytes(frame.payload[:2]))
                     count = seen[key][2] + 1 if key in seen else 1
@@ -1046,6 +1053,8 @@ def _rs485_monitor(args, transport) -> int:
                 "Ctrl+C — выход"
                 % (args.port, args.baud, args.parity, time.strftime("%H:%M:%S"),
                    args.monitor_interval),
+                "",
+                "  " + state.describe(),
                 "",
             ]
             if not seen:
@@ -1090,6 +1099,413 @@ def _rs485_monitor(args, transport) -> int:
     return 0
 
 
+#: Период запроса статуса при сопоставлении, секунды.
+#:
+#: Клиент чередует запросы внутреннего и внешнего блоков, поэтому статус
+#: каждого вида приходит вдвое реже. 3,5 с здесь дают 7 с на каждый вид —
+#: ровно столько, сколько ждёт между запросами эталонная реализация
+#: GrKoR/esphome_aux_ac_component (AC_STATES_REQUEST_INTERVAL = 7000).
+CORRELATE_POLL_INTERVAL = 3.5
+
+
+#: Шаги активного прохода: что менять и в каком порядке.
+#:
+#: Каждый шаг меняет РОВНО ОДНУ величину — в этом весь смысл: если после шага
+#: поехал регистр, причина однозначна. Величины перебираются группами, и
+#: каждая группа заканчивается возвратом к исходному значению, чтобы
+#: следующая группа начиналась с одного и того же состояния.
+#:
+#: Уставка идёт первой и с большим размахом: это самый вероятный кандидат на
+#: регистры 11 и 12, которые в дампе держали 20,0.
+SWEEP_STEPS = (
+    ("питание включено",        "power", True),
+    ("уставка 20",              "target_temp", 20.0),
+    ("уставка 24",              "target_temp", 24.0),
+    ("уставка 28",              "target_temp", 28.0),
+    ("уставка 17",              "target_temp", 17.0),
+    ("уставка 22,5",            "target_temp", 22.5),
+    ("уставка 20",              "target_temp", 20.0),
+    ("режим COOL",              "mode", "cool"),
+    ("режим HEAT",              "mode", "heat"),
+    ("режим FAN",               "mode", "fan"),
+    ("режим DRY",               "mode", "dry"),
+    ("режим AUTO",              "mode", "auto"),
+    ("вентилятор LOW",          "fan", "low"),
+    ("вентилятор MEDIUM",       "fan", "medium"),
+    ("вентилятор HIGH",         "fan", "high"),
+    ("вентилятор AUTO",         "fan", "auto"),
+    ("дисплей выключен",        "display", False),
+    ("дисплей включён",         "display", True),
+    ("питание выключено",       "power", False),
+    ("питание включено",        "power", True),
+)
+
+#: Сколько ждать после команды, прежде чем считать шину обновившейся.
+#:
+#: Цикл опроса шины в дампе занимал секунды, поэтому берём с запасом: лучше
+#: подождать, чем приписать изменение не тому шагу.
+SWEEP_SETTLE = 6.0
+
+
+def _sweep_apply(client, state, what, value):
+    """Применяет одно изменение к состоянию. Возвращает описание или None."""
+    if what == "power":
+        state.set_power(bool(value))
+    elif what == "target_temp":
+        state.set_target_temp(float(value))
+    elif what == "mode":
+        state.set_mode(Mode[value.upper()])
+    elif what == "fan":
+        state.set_fan_speed(FanSpeed[value.upper()])
+    elif what == "display":
+        state.set_display(bool(value))
+    else:
+        return None
+    return "%s = %s" % (what, value)
+
+
+def _sweep_collect(client, bus, decoder, corr, seconds, log_rows=None):
+    """Обновляет статусы UART, затем слушает шину заданное время.
+
+    Запрос статусов здесь обязателен: информационные пакеты кондиционер сам
+    не присылает, только в ответ на запрос. Без свежего статуса коррелятор
+    снимок не возьмёт — сопоставлять регистры будет не с чем.
+
+    Запрашиваются оба статуса. Большой (CMD=0x21) нужен даже в первую
+    очередь: комнатная и внешняя температуры лежат именно в нём, а это самые
+    ценные величины для сопоставления.
+    """
+    for packet, want in ((request_indoor(), Command.INDOOR),
+                         (request_outdoor(), Command.OUTDOOR)):
+        # ответ разбирается внутри poll_once, а on_state отдаёт его коррелятору
+        _ask(client, packet, want, timeout=3.0)
+
+    deadline = time.monotonic() + seconds
+    while not _stop and time.monotonic() < deadline:
+        client.poll_once()
+        chunk = bus.read(256)
+        if chunk:
+            for frame in decoder.feed(chunk):
+                block = frame.block
+                if block is not None:
+                    taken = corr.add_registers(time.monotonic(), frame.cmd,
+                                               block.index, block.values)
+                    if taken and log_rows is not None:
+                        log_rows.append((frame.cmd, block.index, list(block.values)))
+                elif frame.payload:
+                    # нагрузка не разобралась как блок регистров, но данные в
+                    # ней есть: у CMD=0x01 она менялась вслед за уставкой
+                    corr.add_payload(time.monotonic(), frame.cmd, frame.payload)
+        else:
+            time.sleep(0.002)
+
+
+def _corr_where(cmd, reg):
+    """Название места величины в кадре, через модуль сопоставления."""
+    from aux_hvac.correlate import where
+
+    return where(cmd, reg)
+
+
+def run_sweep(args) -> int:
+    """Активный проход по величинам: меняем по одной по UART, смотрим шину.
+
+    Это ускоренный вариант расшифровки регистров. Пассивное сопоставление
+    (:func:`run_correlate`) ждёт, пока величины подвигает человек; здесь
+    скрипт двигает их сам, по одной за шаг, и после каждого шага сообщает,
+    какие регистры шины поехали. Причина изменения при этом однозначна.
+
+    Перед каждым шагом статус перезапрашивается, а команда собирается из
+    свежего статуса — так требует протокол (README, «Последовательности
+    команд»), иначе командой можно затереть то, что изменилось само.
+    """
+    from aux_hvac.correlate import Correlator
+    from aux_hvac.rs485_protocol import RS485Decoder
+
+    if not args.rs485_port:
+        print("Не указан порт шины: --rs485-port COM9", file=sys.stderr)
+        return 2
+
+    uart = SerialTransport(args.port, baudrate=args.baud, parity=args.parity,
+                           timeout=0.05)
+    bus = RS485Transport(args.rs485_port, baudrate=RS485_BAUDRATE,
+                         parity=RS485_PARITY, timeout=0.05)
+    client = AuxClient(uart, active=True, poll_interval=1e9)
+    corr = Correlator(min_samples=3)
+    client.on_state = lambda state, packet: corr.add_uart(time.monotonic(), state)
+
+    try:
+        client.open()
+    except TransportError as exc:
+        print("Ошибка порта UART %s: %s" % (args.port, exc), file=sys.stderr)
+        return 2
+    try:
+        bus.open()
+    except TransportError as exc:
+        client.close()
+        print("Ошибка порта шины %s: %s" % (args.rs485_port, exc), file=sys.stderr)
+        return 2
+
+    decoder = RS485Decoder()
+    log = open(args.log, "a", encoding="utf-8") if args.log else None
+    settle = args.sweep_settle
+
+    def bus_snapshot():
+        """Последние значения всех регистров шины."""
+        out = {}
+        for sample in corr.samples:
+            out.update(sample.regs)
+        return out
+
+    print("Активный проход: %d шагов, по %.0f с на шаг, это примерно %.0f мин."
+          % (len(SWEEP_STEPS), settle, len(SWEEP_STEPS) * settle / 60.0))
+    print("UART %s (%d/8-%s-1), шина %s (%d/8-%s-1)."
+          % (args.port, args.baud, args.parity,
+             args.rs485_port, RS485_BAUDRATE, RS485_PARITY))
+    print("Каждый шаг меняет ровно одну величину. Ctrl+C — остановка.")
+    print("")
+
+    rc = 0
+    try:
+        # исходный срез: даём шине и UART заговорить
+        print("Слушаю оба интерфейса %.0f с до первой команды..." % settle)
+        _sweep_collect(client, bus, decoder, corr, settle)
+        if not corr.samples:
+            print("")
+            print("Ни одного снимка: значит молчит хотя бы один из интерфейсов.",
+                  file=sys.stderr)
+            print("Проверьте по отдельности:", file=sys.stderr)
+            print("  - идут ли кадры с шины: python aux_poll.py -p %s --rs485"
+                  % args.rs485_port, file=sys.stderr)
+            print("  - отвечает ли кондиционер по UART: python aux_poll.py -p %s --status"
+                  % args.port, file=sys.stderr)
+            return 1
+        print("Снимков набрано: %d, кадров с шины: %d."
+              % (len(corr.samples), decoder.frames_seen))
+        print("")
+
+        before = bus_snapshot()
+        for number, (title, what, value) in enumerate(SWEEP_STEPS, 1):
+            if _stop:
+                break
+            packet = _ask(client, request_indoor(), Command.INDOOR, timeout=3.0)
+            if packet is None:
+                print("%2d. %-22s статус не пришёл, шаг пропущен" % (number, title))
+                continue
+            state = decode_state(packet)
+            described = _sweep_apply(client, state, what, value)
+            if described is None:
+                continue
+            client.apply(state)
+
+            _sweep_collect(client, bus, decoder, corr, settle)
+            after = bus_snapshot()
+            moved = [(key, before[key], after[key]) for key in sorted(after)
+                     if key in before and before[key] != after[key]]
+            before = after
+
+            if moved:
+                shown = "; ".join(
+                    "%s: %d -> %d" % (_corr_where(key[0], key[1]), was, now)
+                    for key, was, now in moved)
+            else:
+                shown = "на шине без изменений"
+            print("%2d. %-22s %s" % (number, title, shown))
+            if log is not None:
+                log.write(json.dumps({
+                    "step": number, "title": title,
+                    "change": {"what": what, "value": value},
+                    "moved": [{"cmd": k[0], "reg": k[1], "was": w, "now": n}
+                              for k, w, n in moved],
+                }, ensure_ascii=False) + chr(10))
+                log.flush()
+    except TransportError as exc:
+        print("Ошибка линии: %s" % exc, file=sys.stderr)
+        rc = 2
+    finally:
+        decoder.flush()
+        client.close()
+        bus.close()
+        if log is not None:
+            log.close()
+
+    print("")
+    print("Шина: кадров %d, битых CRC %d, мусорных байт %d."
+          % (decoder.frames_seen, decoder.bad_crc, decoder.dropped_bytes))
+    print("UART: %s" % client.stats.describe())
+    print("")
+    print("=== ИТОГ СОПОСТАВЛЕНИЯ ===")
+    for line in corr.report_lines():
+        print(line)
+    return rc
+
+
+def run_correlate(args) -> int:
+    """Слушает оба интерфейса сразу и сопоставляет регистры шины с полями UART.
+
+    Смысл: у платы два интерфейса, и семантика известна только у одного. Если
+    слушать их одновременно, каждое изменение любой величины сразу даёт пару
+    «известное поле UART — неизвестный регистр RS485». Одна сессия закрывает
+    столько регистров, сколько величин успели подвигаться, вместо одного
+    регистра за пару дампов.
+
+    По UART работаем активно (изображаем wifi-модуль и запрашиваем статусы),
+    по шине — только слушаем: там уже есть свой мастер.
+    """
+    from aux_hvac.correlate import Correlator
+    from aux_hvac.rs485_protocol import RS485Decoder
+
+    if not args.rs485_port:
+        print("Не указан порт шины. Пример:", file=sys.stderr)
+        print("  python aux_poll.py --correlate -p COM6 --rs485-port COM9",
+              file=sys.stderr)
+        return 2
+    if args.rs485_port == args.port:
+        print("Порты UART и шины совпадают (%s) — это два разных интерфейса."
+              % args.port, file=sys.stderr)
+        return 2
+
+    uart = SerialTransport(args.port, baudrate=args.baud, parity=args.parity,
+                           timeout=0.05)
+    bus = RS485Transport(args.rs485_port, baudrate=RS485_BAUDRATE,
+                         parity=RS485_PARITY, timeout=0.05)
+    client = AuxClient(uart, active=True,
+                       poll_interval=args.correlate_interval)
+    corr = Correlator()
+
+    def on_state(state, packet):
+        corr.add_uart(time.monotonic(), state)
+
+    client.on_state = on_state
+
+    try:
+        client.open()
+    except TransportError as exc:
+        print("Ошибка порта UART %s: %s" % (args.port, exc), file=sys.stderr)
+        return 2
+    try:
+        bus.open()
+    except TransportError as exc:
+        client.close()
+        print("Ошибка порта шины %s: %s" % (args.rs485_port, exc), file=sys.stderr)
+        return 2
+
+    decoder = RS485Decoder()
+    log = open(args.log, "a", encoding="utf-8") if args.log else None
+    ansi = _enable_ansi()
+    screen = _Screen(ansi)
+    if not ansi:
+        print("Терминал не поддерживает ANSI: кадры будут идти друг за другом.")
+    screen.start()
+
+    started = time.monotonic()
+    deadline = None if args.duration is None else started + args.duration
+    next_draw = 0.0
+    bus_bytes = 0
+
+    try:
+        while not _stop and (deadline is None or time.monotonic() < deadline):
+            client.poll_once()
+
+            chunk = bus.read(256)
+            if chunk:
+                bus_bytes += len(chunk)
+                for frame in decoder.feed(chunk):
+                    block = frame.block
+                    if block is None:
+                        if frame.payload:
+                            corr.add_payload(time.monotonic(), frame.cmd,
+                                             frame.payload)
+                        continue
+                    taken = corr.add_registers(time.monotonic(), frame.cmd,
+                                               block.index, block.values)
+                    if taken and log is not None:
+                        log.write(json.dumps({
+                            "t": round(time.monotonic() - started, 3),
+                            "cmd": frame.cmd,
+                            "index": block.index,
+                            "values": block.values,
+                            "uart": corr.samples[-1].uart,
+                        }, ensure_ascii=False) + chr(10))
+                        log.flush()
+
+            now = time.monotonic()
+            if now < next_draw:
+                if not chunk:
+                    time.sleep(0.002)
+                continue
+            next_draw = now + max(0.2, args.monitor_interval)
+
+            moved_regs = corr.moved_registers()
+            moved_flds = corr.moved_fields()
+            found = corr.matches()
+
+            lines = [
+                "AUX сопоставление   UART %s  <->  шина %s   %s   Ctrl+C — выход"
+                % (args.port, args.rs485_port, time.strftime("%H:%M:%S")),
+                "",
+                "  снимков %d, статусов UART %s, кадров шины %d, работаем %.0f с"
+                % (len(corr.samples),
+                   "нет" if not corr.samples else "есть",
+                   decoder.frames_seen, now - started),
+                "  подвигалось: полей UART %d, регистров шины %d"
+                % (len(moved_flds), len(moved_regs)),
+                "",
+                "СОПОСТАВЛЕНО",
+                "-" * 70,
+            ]
+            if found:
+                for match in found:
+                    lines.append("  " + match.describe())
+            else:
+                lines.append("  пока ничего")
+
+            lines.append("")
+            lines.append("ПОДВИГАЛОСЬ, НО НЕ СОШЛОСЬ")
+            lines.append("-" * 70)
+            matched = {(m.cmd, m.reg) for m in found}
+            silent = [k for k in moved_regs if k not in matched]
+            if silent:
+                for cmd, reg in silent[:12]:
+                    values = moved_regs[(cmd, reg)]
+                    shown = ", ".join(str(v) for v in values[:6])
+                    if len(values) > 6:
+                        shown += ", ..."
+                    lines.append("  cmd=%02X рег %-3d  %s" % (cmd, reg, shown))
+            else:
+                lines.append("  таких регистров нет")
+
+            lines.append("")
+            lines.append("ЧТО ПОКРУТИТЬ НА ПУЛЬТЕ")
+            lines.append("-" * 70)
+            todo = [n for n in ("target_temp", "mode", "fan_speed", "power",
+                                "vertical_louver", "turbo", "sleep", "display")
+                    if n not in moved_flds]
+            lines.append("  ещё не менялось: %s"
+                         % (", ".join(todo) if todo else "всё перечисленное уже двигали"))
+            screen.draw(lines)
+    except TransportError as exc:
+        screen.stop()
+        print("Ошибка линии: %s" % exc, file=sys.stderr)
+        return 2
+    finally:
+        screen.stop()
+        decoder.flush()
+        client.close()
+        bus.close()
+        if log is not None:
+            log.close()
+
+    print("Байт с шины: %d, кадров %d, битых CRC %d, мусорных байт %d."
+          % (bus_bytes, decoder.frames_seen, decoder.bad_crc,
+             decoder.dropped_bytes))
+    print("UART: %s" % client.stats.describe())
+    print("")
+    for line in corr.report_lines():
+        print(line)
+    return 0
+
+
 def run_rs485(args) -> int:
     """ЗАГОТОВКА: снятие дампа RS485-шины.
 
@@ -1098,7 +1514,7 @@ def run_rs485(args) -> int:
     сырого дампа с нарезкой по паузам в линии. Этого достаточно, чтобы
     подобрать скорость и увидеть границы посылок.
     """
-    from aux_hvac.rs485_protocol import RS485Decoder
+    from aux_hvac.rs485_protocol import BusState, RS485Decoder
     from aux_hvac.transport.rs485 import COMMON_BAUDRATES
 
     transport = RS485Transport(
@@ -1125,6 +1541,7 @@ def run_rs485(args) -> int:
         return _rs485_monitor(args, transport)
 
     decoder = RS485Decoder()
+    state = BusState()
     dump = open(args.dump, "ab") if args.dump else None
     total = 0
     # кадры идут одинаковыми циклами, поэтому по умолчанию печатаем только
@@ -1143,6 +1560,7 @@ def run_rs485(args) -> int:
             if dump is not None:
                 dump.write(chunk)
             for frame in decoder.feed(chunk):
+                state.update(frame)
                 # кадр опознаём по адресам, команде и индексу блока: тогда
                 # изменение значений регистров видно как изменение кадра
                 key = (frame.addr_a, frame.addr_b, frame.cmd, bytes(frame.payload[:2]))
@@ -1159,7 +1577,8 @@ def run_rs485(args) -> int:
         transport.close()
         if dump is not None:
             dump.close()
-        print("\nПринято %d байт, кадров: %d, битых CRC: %d, мусорных байт: %d."
+        print("\n" + state.describe())
+        print("Принято %d байт, кадров: %d, битых CRC: %d, мусорных байт: %d."
               % (total, decoder.frames_seen, decoder.bad_crc, decoder.dropped_bytes))
         if not args.verbose:
             print("Печатались только новые и изменившиеся кадры; -v — печатать все.")
@@ -1270,6 +1689,25 @@ def build_parser() -> argparse.ArgumentParser:
 
     rs = parser.add_argument_group("RS485 (заготовка)")
     rs.add_argument("--rs485", action="store_true", help="работать с RS485-шиной вместо UART модуля")
+    rs.add_argument("--correlate", action="store_true",
+                    help="слушать UART и RS485 одновременно и сопоставлять "
+                         "регистры шины с расшифрованными полями UART")
+    rs.add_argument("--rs485-port", metavar="ПОРТ",
+                    help="порт шины RS485 для --correlate, например COM9")
+    rs.add_argument("--sweep", action="store_true",
+                    help="активный проход: менять величины по UART по одной и "
+                         "смотреть, какие регистры шины на это отвечают")
+    rs.add_argument("--sweep-settle", type=float, default=SWEEP_SETTLE,
+                    help="сколько секунд слушать шину после каждого шага "
+                         "прохода (по умолчанию %.0f). Отдельный флаг от "
+                         "--settle: тот про паузу перед чтением результата "
+                         "одиночной команды" % SWEEP_SETTLE)
+    rs.add_argument("--correlate-interval", type=float,
+                    default=CORRELATE_POLL_INTERVAL,
+                    help="период запроса статусов при сопоставлении, с "
+                         "(по умолчанию %.1f, что даёт 7 с на каждый вид "
+                         "статуса — как в эталонной реализации)"
+                         % CORRELATE_POLL_INTERVAL)
     rs.add_argument("--sniff-raw", action="store_true", help="синоним --rs485 для наглядности")
     rs.add_argument("--address", type=lambda s: int(s, 0), default=0x01, help="адрес устройства на шине")
 
@@ -1322,6 +1760,11 @@ def main(argv: Optional[list] = None) -> int:
     _install_sigint()
 
     try:
+        # --sweep и --correlate раньше --rs485: им нужны оба интерфейса сразу
+        if args.sweep:
+            return run_sweep(args)
+        if args.correlate:
+            return run_correlate(args)
         # --rs485 проверяем раньше --monitor: у шины своя панель, и общий
         # монитор к ней не подходит — там нет ни опроса, ни статуса блока
         if args.rs485 or args.sniff_raw:
