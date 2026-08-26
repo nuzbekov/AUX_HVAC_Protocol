@@ -19,6 +19,7 @@ wifi-модулем и сплитом и разбирает всё, что ви�
 Примеры::
 
     python aux_poll.py --list                      список портов
+    python aux_poll.py -p COM6 --loopback          проверка адаптера (перемычка TX-RX)
     python aux_poll.py -p COM6                     пассивное прослушивание
     python aux_poll.py -p COM6 --active            активный опрос
     python aux_poll.py -p COM6 --json --log ac.jsonl
@@ -40,6 +41,7 @@ import re
 import signal
 import sys
 import time
+from collections import deque
 from typing import Optional
 
 sys.path.insert(0, __file__.rsplit("aux_poll.py", 1)[0] or ".")
@@ -58,9 +60,11 @@ from aux_hvac import (  # noqa: E402
     Packet,
     RS485Transport,
     SerialTransport,
+    StreamDecoder,
     TransportError,
     hexdump,
     list_ports,
+    request_indoor,
 )
 from aux_hvac.const import UART_BAUDRATE, UART_PARITY  # noqa: E402
 
@@ -92,11 +96,17 @@ def _parse_hex(text: str) -> bytes:
 class Reporter:
     """Печатает разобранные кадры и пишет их в файл."""
 
+    #: Сколько секунд кадр считается кандидатом в эхо после отправки.
+    ECHO_WINDOW = 2.0
+
     def __init__(self, args) -> None:
         self.args = args
         self.log = open(args.log, "a", encoding="utf-8") if args.log else None
         self.dump = open(args.dump, "ab") if args.dump else None
         self.started = time.time()
+        self._sent = deque(maxlen=16)
+        """Недавно отправленные кадры: (байты, момент отправки)."""
+        self._echo_noted = False
 
     def close(self) -> None:
         for fh in (self.log, self.dump):
@@ -109,11 +119,34 @@ class Reporter:
             self.log.write(line + "\n")
             self.log.flush()
 
+    def _is_echo(self, packet: Packet) -> bool:
+        """Кадр — это вернувшаяся собственная передача?
+
+        Отличить эхо по содержимому нельзя: байт 3 говорит лишь о том, кто
+        кадр составил, и при пассивном прослушивании кадры wifi-модуля
+        принимать совершенно нормально. Поэтому сверяемся с тем, что сами
+        только что отправили.
+        """
+        raw = packet.raw or packet.encode()
+        now = time.monotonic()
+        return any(
+            sent == raw and now - ts < self.ECHO_WINDOW for sent, ts in self._sent
+        )
+
     def on_packet(self, packet: Packet) -> None:
         if self.args.json:
             return  # в JSON-режиме печатаем на уровне состояния, а не кадра
         stamp = time.strftime("%H:%M:%S")
-        self._emit("%s %s" % (stamp, packet.describe()))
+        echo = self._is_echo(packet)
+        self._emit("%s %s%s" % (stamp, packet.describe(), "  <- эхо" if echo else ""))
+        if echo and not self._echo_noted:
+            self._echo_noted = True
+            print(
+                "Вернулась собственная передача: TX замкнут на RX. Адаптер и "
+                "настройки порта исправны;\nдля работы с кондиционером снимите "
+                "перемычку.",
+                file=sys.stderr,
+            )
 
     def on_send(self, packet: Packet) -> None:
         """Отправленные кадры видно наравне с принятыми.
@@ -121,6 +154,7 @@ class Reporter:
         Без этого активный режим выглядит молчащим до первого ответа
         кондиционера, и непонятно, ушёл запрос в линию или нет.
         """
+        self._sent.append((packet.encode(), time.monotonic()))
         if self.args.json:
             return
         self._emit("%s %s" % (time.strftime("%H:%M:%S"), packet.describe()))
@@ -269,6 +303,79 @@ def run_aux(args) -> int:
     return 0
 
 
+def run_loopback(args) -> int:
+    """Проверка адаптера и настроек порта без кондиционера.
+
+    Отправляет заведомо корректный кадр и ждёт, вернётся ли он. При
+    замкнутых на адаптере TX и RX кадр обязан прийти обратно и разобраться.
+    Это отделяет неисправность адаптера, драйвера или параметров порта от
+    проблем с линией до кондиционера.
+    """
+    transport = SerialTransport(
+        port=args.port,
+        baudrate=args.baud,
+        parity=args.parity,
+        timeout=0.1,
+    )
+
+    try:
+        transport.open()
+    except TransportError as exc:
+        print("Ошибка: %s" % exc, file=sys.stderr)
+        print("Список доступных портов: python aux_poll.py --list", file=sys.stderr)
+        return 2
+
+    probe = request_indoor()
+    raw = probe.encode()
+    timeout = args.duration if args.duration else 3.0
+
+    print("Проверка порта %s на скорости %d, чётность %s."
+          % (args.port, args.baud, args.parity))
+    print("Замкните на адаптере TX и RX, иначе эху взяться неоткуда.")
+    print("Отправляю: %s" % hexdump(raw))
+
+    decoder = StreamDecoder()
+    received = bytearray()
+    packets = []
+    try:
+        transport.reset_input()
+        transport.write(raw)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and not packets:
+            chunk = transport.read(256)
+            if chunk:
+                received.extend(chunk)
+                packets.extend(decoder.feed(chunk))
+            else:
+                time.sleep(0.01)
+    except TransportError as exc:
+        print("Ошибка линии: %s" % exc, file=sys.stderr)
+        return 2
+    finally:
+        transport.close()
+
+    if not received:
+        print()
+        print("Эха нет: за %.0f с не пришло ни одного байта." % timeout)
+        print("Если перемычка TX-RX стоит, значит проблема в адаптере, драйвере")
+        print("или в том, что порт занят другой программой.")
+        return 1
+
+    print("Принято %d байт: %s" % (len(received), hexdump(bytes(received))))
+    if bytes(received) == raw and packets:
+        print()
+        print("Эхо совпало с отправленным, кадр разобран. Адаптер, драйвер и")
+        print("параметры порта (%d/8-%s-1) исправны." % (args.baud, args.parity))
+        print("Снимите перемычку и подключайтесь к кондиционеру.")
+        return 0
+
+    print()
+    print("Байты пришли, но не совпали с отправленным.")
+    print("Так бывает при неверной скорости или чётности: проверьте, что стоит")
+    print("%d/8-%s-1, и что на линии нет второго передатчика." % (args.baud, args.parity))
+    return 1
+
+
 def run_rs485(args) -> int:
     """ЗАГОТОВКА: снятие дампа RS485-шины.
 
@@ -364,6 +471,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-ping", action="store_true", help="в активном режиме не отвечать на ping")
     parser.add_argument("-d", "--duration", type=float, help="сколько секунд работать (по умолчанию бесконечно)")
     parser.add_argument("--send", help="отправить произвольный кадр в hex перед началом опроса")
+    parser.add_argument(
+        "--loopback",
+        action="store_true",
+        help="проверить адаптер и порт: отправить кадр и дождаться эха (нужна перемычка TX-RX)",
+    )
 
     parser.add_argument("--json", action="store_true", help="выводить состояния как JSON Lines")
     parser.add_argument("--log", help="дублировать вывод в файл")
@@ -400,6 +512,8 @@ def main(argv: Optional[list] = None) -> int:
     _install_sigint()
 
     try:
+        if args.loopback:
+            return run_loopback(args)
         if args.rs485 or args.sniff_raw:
             return run_rs485(args)
         return run_aux(args)
