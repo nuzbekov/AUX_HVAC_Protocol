@@ -24,7 +24,7 @@ wifi-модулем и сплитом и разбирает всё, что ви�
     python aux_poll.py -p COM5 --json --log ac.jsonl
     python aux_poll.py -p COM5 --dump line.bin     сохранить сырой поток
     python aux_poll.py -p COM5 --send "BB 00 06 80 00 00 02 00 11 01 2B 7E"
-    python aux_poll.py -p COM5 --rs485 --sniff-raw заготовка: дамп RS485-шины
+    python aux_poll.py -p COM5 --rs485 --dump rs485.bin  заготовка: дамп RS485-шины
 
 Сырой дамп потом разбирается офлайн::
 
@@ -221,8 +221,6 @@ def run_rs485(args) -> int:
         baudrate=args.baud if args.baud != UART_BAUDRATE else 9600,
         parity=args.parity if args.parity != UART_PARITY else "N",
         timeout=args.read_timeout,
-        de_pin=args.de,
-        de_inverted=args.de_inverted,
         address=args.address,
     )
 
@@ -310,12 +308,6 @@ def build_parser() -> argparse.ArgumentParser:
     rs = parser.add_argument_group("RS485 (заготовка)")
     rs.add_argument("--rs485", action="store_true", help="работать с RS485-шиной вместо UART модуля")
     rs.add_argument("--sniff-raw", action="store_true", help="синоним --rs485 для наглядности")
-    rs.add_argument(
-        "--de",
-        choices=["rts", "dtr", "native"],
-        help="управление направлением полудуплекса; не указывать, если адаптер автоматический",
-    )
-    rs.add_argument("--de-inverted", action="store_true", help="инвертировать активный уровень DE")
     rs.add_argument("--address", type=lambda s: int(s, 0), default=0x01, help="адрес устройства на шине")
 
     return parser
