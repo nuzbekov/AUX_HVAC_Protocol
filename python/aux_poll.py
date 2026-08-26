@@ -1054,9 +1054,27 @@ def _rs485_monitor(args, transport) -> int:
                 % (args.port, args.baud, args.parity, time.strftime("%H:%M:%S"),
                    args.monitor_interval),
                 "",
-                "  " + state.describe(),
-                "",
             ]
+
+            # состояние блока идёт первым и построчно: в длинной строке его
+            # не найти глазами среди десятков строк регистров
+            lines.append("СОСТОЯНИЕ БЛОКА")
+            lines.append("-" * 68)
+            if not state.seen_state_frame:
+                lines.append("  кадр CMD=0x01 ещё не приходил — состояние неизвестно")
+                lines.append("  (он идёт через цикл, подождите несколько секунд)")
+            for label, value, source in state.rows():
+                mark = ""
+                key = ("state", label)
+                if key in previous:
+                    if previous[key] != value:
+                        changed_at[key] = now
+                    if now - changed_at.get(key, 0.0) < 5.0:
+                        mark = "<-- изменилось"
+                previous[key] = value
+                lines.append("  %-16s %-22s %-26s %s"
+                             % (label, value, source, mark))
+            lines.append("")
             if not seen:
                 lines.append("  Пока ни одного кадра. Если в линии тишина —")
                 lines.append("  проверьте скорость и подключение A/B.")

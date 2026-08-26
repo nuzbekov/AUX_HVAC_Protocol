@@ -377,6 +377,50 @@ class BusState:
                     self.pipe_temp = values[13] / 10.0
         return self
 
+    def rows(self):
+        """Состояние построчно: (подпись, значение, откуда взято).
+
+        Для панели мониторинга: одной длинной строкой состояние теряется
+        среди десятков строк регистров, а искать в ней глазами «режим» и
+        «вентилятор» неудобно. Здесь же каждая величина отдельной строкой и с
+        указанием, из какого кадра она взята.
+        """
+        from .const import FanSpeed, Mode
+
+        def enum_name(enum_cls, code):
+            if code is None:
+                return "н/д"
+            try:
+                return enum_cls(code).name
+            except ValueError:
+                return "неизвестный код 0x%02X" % code
+
+        def flag(value):
+            return "н/д" if value is None else ("вкл" if value else "выкл")
+
+        def temp(value):
+            return "н/д" if value is None else "%.1f °C" % value
+
+        return [
+            ("питание", flag(self.power), "cmd=01 байт 0 бит 7"),
+            ("режим", enum_name(Mode, self.mode), "cmd=01 байт 0 биты 6..4"),
+            ("вентилятор", enum_name(FanSpeed, self.fan_speed),
+             "cmd=01 байт 0 биты 3..1"),
+            ("уставка", temp(self.target_temp), "cmd=01 байты 2..3"),
+            ("дисплей", flag(self.display), "cmd=01 байт 1 бит 7"),
+            ("датчик ROOM", temp(self.room_temp), "cmd=02 рег 10"),
+            ("датчик PIPE", temp(self.pipe_temp), "cmd=02 рег 13"),
+        ]
+
+    @property
+    def seen_state_frame(self) -> bool:
+        """Приходил ли кадр CMD=0x01, из которого берётся состояние.
+
+        Нужно, чтобы отличать «ещё не приходило» от «выключено»: без этого
+        панель показывала бы столбик «н/д» без объяснения причины.
+        """
+        return self.power is not None
+
     def describe(self) -> str:
         from .const import FanSpeed, Mode
 
