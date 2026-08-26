@@ -338,6 +338,47 @@ class TestRS485Frame(unittest.TestCase):
             self.assertEqual(dec.feed(b"\x00" * 256), [])
         self.assertEqual(dec.dropped_bytes, 100 * 256)
 
+    def test_pipe_register_follows_the_heated_sensor(self):
+        """Регистр 13 — датчик PIPE: прогрев феном поднял только его.
+
+        Кадр снят с шины после прогрева датчика теплообменника
+        строительным феном. В опорном цикле тот же регистр держал 247.
+        Заодно проверяем, что разрешение здесь 0,1 градуса, а не 1 градус,
+        как в байте 17 UART-протокола.
+        """
+        from aux_hvac.rs485_protocol import RS485Frame
+
+        hot = RS485Frame.decode(bytes.fromhex(
+            "7E01F1022B031100110122014000C0FC10E400000000FC00C800C802E4"
+            "0000000037011904010101322DAC"))
+        self.assertTrue(hot.crc_ok)
+        values = dict(hot.block.items())
+        self.assertEqual(values[13], 740)                    # 74,0 градуса
+        self.assertAlmostEqual(hot.block.as_celsius(values[13]), 74.0)
+
+        cold = [f for f in self.frames()[0] if f.cmd == 0x02][0]
+        self.assertEqual(dict(cold.block.items())[13], 247)  # 24,7 градуса
+
+        # изменился ровно один регистр, кроме дрейфа датчика комнаты
+        moved = [reg for reg, was in dict(cold.block.items()).items()
+                 if was != values[reg]]
+        self.assertEqual(sorted(moved), [10, 13])
+
+    def test_decoded_registers_are_labelled_per_command(self):
+        """Подпись регистра привязана к команде: номера у команд перекрываются."""
+        from aux_hvac.rs485_protocol import KNOWN_REGISTERS
+
+        frames, _ = self.frames()
+        big = [f for f in frames if f.cmd == 0x02][0]
+        self.assertIn("PIPE", big.describe())
+
+        # у CMD=0x12 тоже есть регистры 10..13, но они нулевые и датчиками
+        # не являются — подписываться они не должны
+        other = [f for f in frames if f.cmd == 0x12 and f.block.index == 10][0]
+        self.assertNotIn("PIPE", other.describe())
+        self.assertNotIn("ROOM", other.describe())
+        self.assertEqual(set(KNOWN_REGISTERS), {(0x02, 10), (0x02, 13)})
+
     def test_semantics_still_refuse_to_guess(self):
         """Смысл регистров не расшифрован — parse_status обязан это сказать."""
         from aux_hvac.rs485_protocol import NotDecodedYet, parse_status
