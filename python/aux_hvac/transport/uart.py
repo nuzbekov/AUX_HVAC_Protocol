@@ -35,7 +35,7 @@ def list_ports() -> List[str]:
 class SerialTransport(Transport):
     """Канал поверх последовательного порта (COM/ttyUSB).
 
-    :param port: имя порта, например ``COM5`` или ``/dev/ttyUSB0``.
+    :param port: имя порта, например ``COM6`` или ``/dev/ttyUSB0``.
     :param baudrate: по умолчанию 4800 — как требует протокол AUX.
     :param parity: по умолчанию ``E`` (even).
     :param timeout: таймаут чтения в секундах.

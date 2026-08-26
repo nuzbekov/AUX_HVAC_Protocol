@@ -96,10 +96,10 @@ python aux_tool.py replay line.bin --binary --summary
 
 ```
 python aux_poll.py --list                 список COM-портов
-python aux_poll.py -p COM5                пассивное прослушивание
-python aux_poll.py -p COM5 --active       эмуляция wifi-модуля
-python aux_poll.py -p COM5 --json --log ac.jsonl
-python aux_poll.py -p COM5 --dump line.bin
+python aux_poll.py -p COM6                пассивное прослушивание
+python aux_poll.py -p COM6 --active       эмуляция wifi-модуля
+python aux_poll.py -p COM6 --json --log ac.jsonl
+python aux_poll.py -p COM6 --dump line.bin
 ```
 
 **Пассивный режим** (по умолчанию) молча слушает линию между штатным
@@ -123,7 +123,7 @@ wifi-модулем и сплитом. Ничего не передаёт, по�
 ```python
 from aux_hvac import AuxClient, SerialTransport
 
-with AuxClient(SerialTransport("COM5")) as client:
+with AuxClient(SerialTransport("COM6")) as client:
     client.on_state = lambda state, packet: print(state.describe())
     client.run(duration=60)
 ```
@@ -134,7 +134,7 @@ with AuxClient(SerialTransport("COM5")) as client:
 ```python
 from aux_hvac import AuxClient, Mode, FanSpeed, SerialTransport
 
-with AuxClient(SerialTransport("COM5"), active=True) as client:
+with AuxClient(SerialTransport("COM6"), active=True) as client:
     client.request()                      # запрос статуса внутреннего блока
     client.run(duration=5)                # ждём ответ
     state = client.indoor.copy()
@@ -190,8 +190,8 @@ print(decode_state(packet).to_dict())
 как в Modbus RTU:
 
 ```
-python aux_poll.py -p COM5 --rs485 --baud 9600 --dump rs485.bin
-python aux_poll.py -p COM5 --rs485 --baud 19200
+python aux_poll.py -p COM6 --rs485 --baud 9600 --dump rs485.bin
+python aux_poll.py -p COM6 --rs485 --baud 19200
 ```
 
 Порядок дальнейшей работы:

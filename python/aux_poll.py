@@ -19,12 +19,12 @@ wifi-модулем и сплитом и разбирает всё, что ви�
 Примеры::
 
     python aux_poll.py --list                      список портов
-    python aux_poll.py -p COM5                     пассивное прослушивание
-    python aux_poll.py -p COM5 --active            активный опрос
-    python aux_poll.py -p COM5 --json --log ac.jsonl
-    python aux_poll.py -p COM5 --dump line.bin     сохранить сырой поток
-    python aux_poll.py -p COM5 --send "BB 00 06 80 00 00 02 00 11 01 2B 7E"
-    python aux_poll.py -p COM5 --rs485 --dump rs485.bin  заготовка: дамп RS485-шины
+    python aux_poll.py -p COM6                     пассивное прослушивание
+    python aux_poll.py -p COM6 --active            активный опрос
+    python aux_poll.py -p COM6 --json --log ac.jsonl
+    python aux_poll.py -p COM6 --dump line.bin     сохранить сырой поток
+    python aux_poll.py -p COM6 --send "BB 00 06 80 00 00 02 00 11 01 2B 7E"
+    python aux_poll.py -p COM6 --rs485 --dump rs485.bin  заготовка: дамп RS485-шины
 
 Сырой дамп потом разбирается офлайн::
 
@@ -285,7 +285,7 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=__doc__,
     )
     parser.add_argument("-l", "--list", action="store_true", help="показать доступные порты и выйти")
-    parser.add_argument("-p", "--port", help="порт, например COM5 или /dev/ttyUSB0")
+    parser.add_argument("-p", "--port", help="порт, например COM6 или /dev/ttyUSB0")
     parser.add_argument("-b", "--baud", type=int, default=UART_BAUDRATE, help="скорость (по умолчанию 4800)")
     parser.add_argument(
         "--parity",

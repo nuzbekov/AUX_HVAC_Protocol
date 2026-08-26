@@ -9,7 +9,7 @@
 
     from aux_hvac import AuxClient, SerialTransport
 
-    with AuxClient(SerialTransport("COM5")) as client:
+    with AuxClient(SerialTransport("COM6")) as client:
         client.on_packet = lambda p: print(p.describe())
         client.run(duration=60)
 
