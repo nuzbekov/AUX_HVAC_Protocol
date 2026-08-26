@@ -1152,8 +1152,31 @@ SWEEP_STEPS = (
     ("вентилятор MEDIUM",       "fan", "medium"),
     ("вентилятор HIGH",         "fan", "high"),
     ("вентилятор AUTO",         "fan", "auto"),
+    # Логические величины переключаются дважды туда и обратно. Одного
+    # переключения мало: если величина уже была в нужном состоянии, команда
+    # ничего не меняет, перехода не происходит, и соответствие остаётся
+    # недоказанным. Именно так дисплей попадал в догадки.
+    ("дисплей включён",         "display", True),
     ("дисплей выключен",        "display", False),
     ("дисплей включён",         "display", True),
+    ("дисплей выключен",        "display", False),
+    ("дисплей включён",         "display", True),
+    # TURBO нужен режим, в котором он вообще применим
+    ("режим COOL для TURBO",    "mode", "cool"),
+    ("TURBO включён",           "turbo", True),
+    ("TURBO выключен",          "turbo", False),
+    ("TURBO включён",           "turbo", True),
+    ("TURBO выключен",          "turbo", False),
+    ("SLEEP включён",           "sleep", True),
+    ("SLEEP выключен",          "sleep", False),
+    ("SLEEP включён",           "sleep", True),
+    ("SLEEP выключен",          "sleep", False),
+    ("шторки STOP",             "louver", "stop"),
+    ("шторки SWING",            "louver", "swing"),
+    ("шторки STOP",             "louver", "stop"),
+    ("шторки SWING",            "louver", "swing"),
+    ("питание выключено",       "power", False),
+    ("питание включено",        "power", True),
     ("питание выключено",       "power", False),
     ("питание включено",        "power", True),
 )
@@ -1177,6 +1200,12 @@ def _sweep_apply(client, state, what, value):
         state.set_fan_speed(FanSpeed[value.upper()])
     elif what == "display":
         state.set_display(bool(value))
+    elif what == "turbo":
+        state.set_turbo(bool(value))
+    elif what == "sleep":
+        state.set_sleep(bool(value))
+    elif what == "louver":
+        state.set_vertical_louver(VerticalLouver[value.upper()])
     else:
         return None
     return "%s = %s" % (what, value)

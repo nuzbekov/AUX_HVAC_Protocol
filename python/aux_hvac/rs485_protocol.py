@@ -67,10 +67,15 @@
     байт 0   бит 7      питание
              биты 6..4  режим, коды как в UART (:class:`aux_hvac.const.Mode`)
              биты 3..1  скорость вентилятора (:class:`~aux_hvac.const.FanSpeed`)
-             бит 0      всегда 0
+             бит 0      качание шторок
     байт 1   бит 7      дисплей
+             бит 2      SLEEP
     байты 2..3          уставка, десятые доли градуса, big-endian
     байты 4..5          не расшифровано: принимает 0 и 5
+
+Байт 0 расшифрован целиком. Бит 0 поначалу считался всегда нулевым — он и
+был нулевым, пока в опыт не добавили шторки: при включении качания байт шёл
+``0x9A -> 0x9B``.
 
 Замечательно тут то, что **коды режима и скорости те же, что в
 UART-протоколе**, только сдвинуты на один бит: в UART они занимают биты 7..5
@@ -81,6 +86,27 @@ UART-протоколе**, только сдвинуты на один бит: �
 Проверка: байт `0x92` = питание включено, режим `001` = COOL, скорость
 `001` = HIGH — и UART в тот же момент показывал ровно «вкл, режим COOL,
 вентилятор HIGH».
+
+Регистр 7 кадра ``CMD=0x02``: упакованные флаги
+===============================================
+
+Этот регистр поначалу принимали за температуру, а значение ``-100.8`` — за
+«датчик не подключён». Это неверно: регистр — набор битовых полей, и
+сопоставлением с UART в нём опознаны три::
+
+    бит 7    SLEEP
+    бит 8    TURBO
+    бит 13   качание шторок
+
+TURBO виден только здесь: в кадре ``CMD=0x01`` он не отражается вовсе. При
+включении регистр менялся ровно на ``0x0100``, что и есть бит 8.
+
+Остальные биты регистра 7 не расшифрованы. Младший байт принимал значения
+``0x10``, ``0x50``, ``0x90``, ``0xD0`` — то есть меняются его биты 6 и 7,
+причём заметно похоже на реальную скорость вентилятора: при MEDIUM выходило
+``10``, при HIGH ``01``, а в режиме HEAT без горячей воды ``00``. Но
+подтверждения нет: поле ``real_fan_speed`` UART-протокола за все опыты с
+ним не сошлось.
 
 Два регистра кадра ``CMD=0x02`` расшифрованы опытом, см.
 :data:`KNOWN_REGISTERS`:
@@ -346,6 +372,13 @@ class BusState:
     """Заданная скорость. Коды совпадают с :class:`aux_hvac.const.FanSpeed`."""
 
     display: Optional[bool] = None
+    sleep: Optional[bool] = None
+    swing: Optional[bool] = None
+    """Качание шторок: бит 0 байта 0 кадра CMD=0x01."""
+
+    turbo: Optional[bool] = None
+    """TURBO. Виден только в бите 8 регистра 7 кадра CMD=0x02."""
+
     target_temp: Optional[float] = None
     """Уставка, градусы."""
 
@@ -364,7 +397,9 @@ class BusState:
             self.power = bool(first & 0x80)
             self.mode = (first >> 4) & 0x07
             self.fan_speed = (first >> 1) & 0x07
+            self.swing = bool(first & 0x01)
             self.display = bool(frame.payload[1] & 0x80)
+            self.sleep = bool(frame.payload[1] & 0x04)
             self.target_temp = int.from_bytes(
                 frame.payload[2:4], "big", signed=True) / 10.0
         elif frame.cmd == 0x02:
@@ -375,6 +410,9 @@ class BusState:
                     self.room_temp = values[10] / 10.0
                 if 13 in values:
                     self.pipe_temp = values[13] / 10.0
+                if 7 in values:
+                    # регистр 7 — упакованные флаги, а не температура
+                    self.turbo = bool(values[7] & 0x0100)
         return self
 
     def rows(self):
@@ -408,6 +446,9 @@ class BusState:
              "cmd=01 байт 0 биты 3..1"),
             ("уставка", temp(self.target_temp), "cmd=01 байты 2..3"),
             ("дисплей", flag(self.display), "cmd=01 байт 1 бит 7"),
+            ("SLEEP", flag(self.sleep), "cmd=01 байт 1 бит 2"),
+            ("качание шторок", flag(self.swing), "cmd=01 байт 0 бит 0"),
+            ("TURBO", flag(self.turbo), "cmd=02 рег 7 бит 8"),
             ("датчик ROOM", temp(self.room_temp), "cmd=02 рег 10"),
             ("датчик PIPE", temp(self.pipe_temp), "cmd=02 рег 13"),
         ]
@@ -437,11 +478,14 @@ class BusState:
 
         power = "н/д" if self.power is None else ("вкл" if self.power else "выкл")
         display = "н/д" if self.display is None else ("вкл" if self.display else "выкл")
-        return ("шина: %s, режим %s, вентилятор %s, уставка %s, "
-                "дисплей %s, ROOM %s, PIPE %s"
+        return ("шина: %s, режим %s, вентилятор %s, уставка %s, дисплей %s, "
+                "SLEEP %s, качание %s, TURBO %s, ROOM %s, PIPE %s"
                 % (power, enum_name(Mode, self.mode),
                    enum_name(FanSpeed, self.fan_speed),
                    temp(self.target_temp), display,
+                   "н/д" if self.sleep is None else ("вкл" if self.sleep else "выкл"),
+                   "н/д" if self.swing is None else ("вкл" if self.swing else "выкл"),
+                   "н/д" if self.turbo is None else ("вкл" if self.turbo else "выкл"),
                    temp(self.room_temp), temp(self.pipe_temp)))
 
 

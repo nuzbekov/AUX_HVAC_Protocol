@@ -404,6 +404,42 @@ class TestRS485Frame(unittest.TestCase):
         self.assertIn("режим COOL", state.describe())
         self.assertIn("вентилятор HIGH", state.describe())
 
+    def test_bus_state_decodes_sleep_swing_and_turbo(self):
+        """SLEEP, качание шторок и TURBO. Сверено с UART на живом железе.
+
+        Три отдельных места: SLEEP в байте 1, качание в бите 0 байта 0 (тот
+        считался всегда нулевым, пока в опыт не добавили шторки), а TURBO
+        вообще не в этом кадре — только в бите 8 регистра 7 кадра CMD=0x02.
+        """
+        from aux_hvac.rs485_protocol import BusState, RS485Frame
+
+        def state_frame(byte0, byte1):
+            return RS485Frame.decode(RS485Frame(
+                addr_a=0x01, addr_b=0xF1, cmd=0x01,
+                payload=bytes([byte0, byte1, 0x00, 0xC8, 0x00, 0x00])).encode())
+
+        # 0x9A: питание, режим COOL, вентилятор AUTO, качания нет
+        state = BusState().update(state_frame(0x9A, 0x80))
+        self.assertIs(state.swing, False)
+        self.assertIs(state.sleep, False)
+        self.assertIs(state.display, True)
+
+        # 0x9B: тот же байт с битом 0 — включилось качание
+        state.update(state_frame(0x9B, 0x84))
+        self.assertIs(state.swing, True)
+        self.assertIs(state.sleep, True)          # бит 2 байта 1
+
+        # TURBO живёт в регистре 7 кадра CMD=0x02, а не в состоянии
+        self.assertIsNone(state.turbo)
+        block = bytes([7, 1]) + (0xFD50).to_bytes(2, "big")
+        state.update(RS485Frame.decode(RS485Frame(
+            addr_a=0x01, addr_b=0xF1, cmd=0x02, payload=block).encode()))
+        self.assertIs(state.turbo, True)
+        block = bytes([7, 1]) + (0xFC50).to_bytes(2, "big")
+        state.update(RS485Frame.decode(RS485Frame(
+            addr_a=0x01, addr_b=0xF1, cmd=0x02, payload=block).encode()))
+        self.assertIs(state.turbo, False)
+
     def test_bus_state_keeps_halves_of_a_degree(self):
         """Уставка 27,5 должна дойти без потерь: на шине это 275 десятых."""
         from aux_hvac.rs485_protocol import BusState, RS485Frame
@@ -582,6 +618,52 @@ class TestCorrelator(unittest.TestCase):
         hit = [m for m in corr.matches() if m.field == "indoor_temp"]
         self.assertTrue(hit)
         self.assertEqual(hit[0].samples, len(self.ROOMS))
+
+    def test_no_bitfield_hunting_inside_a_known_sensor(self):
+        """Внутри опознанной температуры флаги не ищутся.
+
+        Датчик плывёт непрерывно, младшие биты щёлкают часто, и любой
+        двухзначный флаг рано или поздно попадёт с ними в такт. Так на живом
+        железе появилось «бит 1 регистра 13 = дисплей», хотя регистр 13 —
+        это датчик PIPE.
+        """
+        from aux_hvac.correlate import Correlator, _analog_places
+
+        self.assertIn((0x02, 13), _analog_places())
+
+        class Fake:
+            def __init__(self, flag):
+                self._d = {"display": bool(flag)}
+
+            def to_dict(self):
+                return dict(self._d)
+
+        # температура плывёт так, что её бит 1 повторяет флаг
+        corr = Correlator()
+        for n, flag in enumerate([0, 1, 0, 1, 0, 1]):
+            corr.add_uart(n, Fake(flag))
+            corr.add_registers(n, 0x02, 13, [250 + (2 if flag else 0)])
+        self.assertEqual([m for m in corr.matches() if m.width], [])
+
+        # а в неизвестном регистре такое поле искать надо
+        corr = Correlator()
+        for n, flag in enumerate([0, 1, 0, 1, 0, 1]):
+            corr.add_uart(n, Fake(flag))
+            corr.add_registers(n, 0x02, 99, [250 + (2 if flag else 0)])
+        self.assertTrue([m for m in corr.matches() if m.width])
+
+    def test_transitions_are_counted_across_the_settling_lag(self):
+        """Переход считается, даже когда шина догоняет поле не сразу.
+
+        Считать по соседним снимкам было ошибкой: поле меняется в одном
+        снимке, величина в следующем, и такой переход не попадал в счёт
+        вовсе — скорость вентилятора, изменённая четыре раза, давала один.
+        """
+        from aux_hvac.correlate import _count_transitions
+
+        lagging = [(1, 10), (2, 10), (2, 20), (3, 20), (3, 30),
+                   (2, 30), (2, 20), (1, 20), (1, 10)]
+        self.assertEqual(_count_transitions(lagging, 10), 4)
 
     def test_packed_bitfields_are_found(self):
         """Питание и режим на шине упакованы в один байт — их надо находить.

@@ -76,6 +76,7 @@ __all__ = [
     "where",
     "BITFIELD_WIDTHS",
     "MIN_PURITY",
+    "MIN_TRANSITIONS",
 ]
 
 #: Смещение ключей для 16-битных слов нагрузки, не разобранной как регистры.
@@ -86,6 +87,18 @@ RAW_WORD_BASE = 1000
 
 #: Смещение ключей для отдельных байтов такой нагрузки.
 RAW_BYTE_BASE = 2000
+
+#: Сколько раз величина должна измениться **вместе** с полем, чтобы
+#: соответствие считалось надёжным.
+#:
+#: Одного совпадения мало. У поля с двумя значениями — питание, дисплей,
+#: SLEEP — почти любой бит успевает совпасть один раз: он поменялся когда-то
+#: сам по себе, и этого хватило. Так на живом железе появилось «бит 13
+#: регистра 7 = питание», причём тот же бит одновременно заявлялся как
+#: положение шторок. Два перехода такие находки убирают: проход меняет каждую
+#: величину туда и обратно, поэтому у настоящего соответствия переходов не
+#: меньше двух.
+MIN_TRANSITIONS = 2
 
 #: Какую долю группы должно занять значение регистра, чтобы считаться
 #: устойчивым.
@@ -143,6 +156,21 @@ class Match:
     width: int = 0
     """Ширина битового поля. 0 — значение сравнивалось целиком."""
 
+    transitions: int = 0
+    """Сколько раз величина изменилась одновременно с полем.
+
+    Считается по соседним снимкам. Одного перехода недостаточно: см.
+    :data:`MIN_TRANSITIONS`.
+    """
+
+    ambiguous_place: bool = False
+    """Претендует ли на это же место другое, не совпадающее с этим, поле.
+
+    Если одно и то же место кадра «объясняет» сразу два разных поля, хотя бы
+    одно из объяснений ложно, и оба уходят в догадки. Одно и то же значение
+    под двумя именами противоречием не считается.
+    """
+
     one_to_one: bool = True
     """Взаимно ли однозначно соответствие.
 
@@ -165,6 +193,10 @@ class Match:
 
     def describe(self) -> str:
         note = "" if self.one_to_one else ", связь односторонняя"
+        if self.transitions < MIN_TRANSITIONS:
+            note += ", переходов всего %d" % self.transitions
+        if self.ambiguous_place:
+            note += ", на это место претендует и другое поле"
         return ("%-34s = %s%s   (сошлось на %d значениях поля из %d%s)"
                 % (self.place, self.field,
                    "" if self.scale == 1 else " * %d" % self.scale,
@@ -206,18 +238,69 @@ def _stable_by_field(pairs, min_purity: float = MIN_PURITY):
 
     stable, ambiguous = {}, 0
     for left, values in groups.items():
-        tail = values[len(values) // 2:] or values
-        counts = {}
-        for value in tail:
-            counts[value] = counts.get(value, 0) + 1
-        # при равенстве голосов берём меньшее значение, чтобы результат не
-        # зависел от порядка перебора
-        top = min(counts, key=lambda v: (-counts[v], v))
-        if float(counts[top]) / len(tail) < min_purity:
+        top, purity = _settled(values)
+        if purity < min_purity:
             ambiguous += 1
             continue
         stable[left] = top
     return stable, ambiguous
+
+
+def _settled(values):
+    """Значение, на котором последовательность устоялась.
+
+    Берётся самое частое во второй половине: переходные наблюдения всегда в
+    начале — там, где поле уже изменилось, а шина ещё нет.
+    """
+    tail = values[len(values) // 2:] or list(values)
+    counts = {}
+    for value in tail:
+        counts[value] = counts.get(value, 0) + 1
+    return min(counts, key=lambda v: (-counts[v], v)), float(counts[
+        min(counts, key=lambda v: (-counts[v], v))]) / len(tail)
+
+
+def _runs(pairs):
+    """Разбивает наблюдения на отрезки постоянного значения поля.
+
+    Возвращает список ``(значение поля, устоявшееся значение величины)`` в
+    порядке наблюдений. Один отрезок — это один шаг опыта: поле держится, а
+    величина за это время успевает догнать.
+    """
+    runs, current, bucket = [], None, []
+    for left, right in pairs:
+        if bucket and left != current:
+            runs.append((current, _settled(bucket)[0]))
+            bucket = []
+        current = left
+        bucket.append(right)
+    if bucket:
+        runs.append((current, _settled(bucket)[0]))
+    return runs
+
+
+def _count_transitions(pairs, scale=1):
+    """Сколько раз величина изменилась вслед за полем.
+
+    Считать по соседним снимкам нельзя, и это была ошибка: из-за задержки
+    шины поле и величина меняются в разных парах снимков — сначала поле, а
+    величина только в следующем снимке. Такой переход не попадал в счёт
+    вовсе, и скорость вентилятора, изменённая четыре раза, давала один
+    переход.
+
+    Поэтому наблюдения сначала разбиваются на отрезки постоянного значения
+    поля (:func:`_runs`), и переходы считаются между соседними отрезками:
+    поле изменилось, величина изменилась, и оба конца укладываются в
+    гипотезу.
+    """
+    runs = _runs(pairs)
+    count = 0
+    for (left_a, right_a), (left_b, right_b) in zip(runs, runs[1:]):
+        if left_a == left_b or right_a == right_b:
+            continue
+        if round(left_a * scale) == right_a and round(left_b * scale) == right_b:
+            count += 1
+    return count
 
 
 def _is_one_to_one(stable, scale=1):
@@ -285,6 +368,23 @@ def numeric_fields(state) -> Dict[str, float]:
     return out
 
 
+def _analog_places():
+    """Места, про которые уже известно, что там аналоговая величина.
+
+    Внутри температуры искать флаги бессмысленно и вредно: датчик плывёт
+    непрерывно, его младшие биты щёлкают часто, и любой двухзначный флаг
+    рано или поздно попадёт с ними в такт. Именно так появилось «бит 1
+    регистра 13 = дисплей», хотя регистр 13 — это датчик PIPE.
+
+    Берётся из уже расшифрованного: :data:`aux_hvac.rs485_protocol.KNOWN_REGISTERS`.
+    """
+    try:
+        from .rs485_protocol import KNOWN_REGISTERS
+    except ImportError:                      # pragma: no cover
+        return frozenset()
+    return frozenset(KNOWN_REGISTERS)
+
+
 class Correlator:
     """Копит снимки и ищет соответствия «поле UART — регистр шины».
 
@@ -303,10 +403,15 @@ class Correlator:
         min_agreement: float = 0.9,
         min_distinct: int = 2,
         min_samples: int = 4,
+        analog_places=None,
     ) -> None:
         self.min_agreement = min_agreement
         self.min_distinct = min_distinct
         self.min_samples = min_samples
+        self.analog_places = (frozenset(_analog_places())
+                              if analog_places is None
+                              else frozenset(analog_places))
+        """Места, внутри которых битовые поля не ищутся. См. :func:`_analog_places`."""
 
         self.samples: List[Sample] = []
         self.raw_samples = 0
@@ -437,12 +542,18 @@ class Correlator:
                         field=name, cmd=cmd, reg=reg, scale=scale,
                         agreement=agreement, samples=total,
                         distinct=len(set(stable.values())),
+                        transitions=_count_transitions(pairs, scale),
                         one_to_one=_is_one_to_one(stable, scale)))
                     continue
 
                 # значение целиком не сошлось — пробуем битовые поля внутри
                 # него: питание, дисплей, режим и скорость на шине упакованы
                 # в один байт, и целиком такое значение ни с чем не совпадёт
+                if (cmd, reg) in self.analog_places:
+                    # это уже опознанная аналоговая величина: искать в её
+                    # младших битах флаги — верный способ найти совпадение
+                    # по совпадению
+                    continue
                 match = self._best_bitfield(name, cmd, reg, pairs)
                 if match is not None:
                     found.append(match)
@@ -497,17 +608,59 @@ class Correlator:
             seen.add(key)
             out.append(match)
         out.sort(key=lambda m: (-m.agreement, -m.distinct, m.cmd, m.reg, m.shift))
-        return out
+        return self._mark_contradictions(out)
+
+    def _mark_contradictions(self, found):
+        """Помечает места, на которые претендует больше одного поля.
+
+        Одно место кадра не может означать две разные величины: хотя бы одно
+        объяснение ложно, и доверять нельзя ни одному. Так отсеялось «бит 13
+        регистра 7», заявленный сразу как питание и как положение шторок.
+
+        Исключение — поля, которые за всю сессию совпадали значение в
+        значение. Это одна и та же величина под двумя именами (например
+        заданная температура и она же «как её сообщает блок»), и никакого
+        противоречия тут нет.
+        """
+        by_place = {}
+        for match in found:
+            by_place.setdefault(self._place_key(match), []).append(match)
+
+        series = {}
+        for name in {m.field for m in found}:
+            series[name] = tuple(s.uart.get(name) for s in self.samples)
+
+        for matches in by_place.values():
+            names = {m.field for m in matches}
+            if len(names) < 2:
+                continue
+            distinct_series = {series[n] for n in names}
+            if len(distinct_series) == 1:
+                continue          # одна величина под разными именами
+            for match in matches:
+                match.ambiguous_place = True
+        return found
+
+    def _is_reliable(self, match) -> bool:
+        """Годится ли соответствие в расшифровку.
+
+        Требований четыре, и каждое появилось после конкретной ложной находки
+        на живом железе: точное совпадение, взаимная однозначность, хотя бы
+        :data:`MIN_TRANSITIONS` согласованных переходов и отсутствие спора за
+        это место с другим полем.
+        """
+        return (match.agreement >= self.EXACT
+                and match.one_to_one
+                and match.transitions >= MIN_TRANSITIONS
+                and not match.ambiguous_place)
 
     def reliable(self):
-        """Соответствия, годные в расшифровку: точные и взаимно однозначные."""
-        return [m for m in self.matches()
-                if m.agreement >= self.EXACT and m.one_to_one]
+        """Соответствия, годные в расшифровку."""
+        return [m for m in self.matches() if self._is_reliable(m)]
 
     def guesses(self):
-        """Всё остальное: неточное либо односторонее. Догадки, не факты."""
-        return [m for m in self.matches()
-                if m.agreement < self.EXACT or not m.one_to_one]
+        """Всё остальное. Догадки, не факты."""
+        return [m for m in self.matches() if not self._is_reliable(m)]
 
     def _best_bitfield(self, name, cmd, reg, pairs):
         """Ищет битовое поле внутри значения, повторяющее поле UART.
@@ -543,12 +696,13 @@ class Correlator:
                 if best is None or (agreement, -width) > (best[0], -best[2]):
                     best = (agreement, shift, width, total,
                             len(set(stable.values())),
-                            _is_one_to_one(stable))
+                            _is_one_to_one(stable),
+                            _count_transitions(extracted))
         if best is None:
             return None
-        agreement, shift, width, groups, distinct, one_to_one = best
+        agreement, shift, width, groups, distinct, one_to_one, moves = best
         return Match(field=name, cmd=cmd, reg=reg, scale=1, agreement=agreement,
-                     samples=groups, distinct=distinct,
+                     samples=groups, distinct=distinct, transitions=moves,
                      shift=shift, width=width, one_to_one=one_to_one)
 
     def moved_registers(self):
