@@ -1633,6 +1633,352 @@ def run_rs485(args) -> int:
     return 0
 
 
+#: Сколько секунд линия должна молчать, чтобы считать её свободной.
+#:
+#: Мастер шлёт кадры пачкой: между соседними кадрами пачки пауз почти нет,
+#: а между пачками — секунды. Пауза в четверть длительности самого короткого
+#: кадра (10 байт на 9600 это около 10 мс) надёжно отделяет одно от другого,
+#: не дожидаясь конца всей пачки.
+PROBE_IDLE = 0.05
+
+#: Во сколько раз ответы должны участиться, чтобы поверить, что плата
+#: услышала именно нас.
+#:
+#: Штатный цикл сам по себе слегка плавает, поэтому небольшой разброс ни о
+#: чём не говорит. Полуторакратный рост случайным дрожанием не объяснить.
+PROBE_RATE_FACTOR = 1.5
+
+#: Сколько ждать ответа после своего кадра.
+#:
+#: Собственные ответы платы приходят сразу за опросом, в пределах десятков
+#: миллисекунд. Полсекунды — с запасом, и при этом мы успеваем отдать линию
+#: до следующей пачки мастера.
+PROBE_WAIT = 0.5
+
+
+def run_rs485_probe_collide(args) -> int:
+    """Проверка передатчика столкновением: не зависит от того, слышит ли плата.
+
+    Шлёт короткий кадр НЕ дожидаясь паузы — специально поверх идущей по шине
+    передачи. Если наш сигнал реально ложится на линию, CRC у кого-то из
+    участников штатного цикла перестанет сходиться прямо во время передачи.
+    Если нет — испорченных кадров не прибавится, сколько ни пытайся.
+
+    Кадр умышленно совсем короткий (доля от 10 байт минимального кадра
+    шины), чтобы почти наверняка угодить внутрь чужой передачи, а не в
+    паузу перед ней.
+    """
+    from aux_hvac.rs485_protocol import RS485Decoder
+
+    transport = RS485Transport(
+        port=args.port, baudrate=args.baud, parity=args.parity,
+        timeout=args.read_timeout, address=args.address,
+    )
+    print("RS485: проверка передатчика столкновением.")
+    print("Параметры: %r" % transport)
+    print("Шлём короткий мусор поверх чужих передач и смотрим, портится ли "
+          "их CRC.")
+    print("Ctrl+C — остановка.\n")
+
+    try:
+        transport.open()
+    except TransportError as exc:
+        print("Ошибка: %s" % exc, file=sys.stderr)
+        return 2
+
+    decoder = RS485Decoder()
+    garbage = bytes([0xFF, 0x00, 0xFF, 0x00])
+    total_frames = total_bad = 0
+    hits = tries = 0
+
+    try:
+        deadline = time.monotonic() + args.probe_collide
+        while not _stop and time.monotonic() < deadline:
+            before_bad = decoder.bad_crc
+            transport.write(garbage)
+            tries += 1
+            chunk = transport.read(64)
+            if chunk:
+                decoder.feed(chunk)
+            if decoder.bad_crc > before_bad:
+                hits += 1
+            time.sleep(0.003)
+        total_frames, total_bad = decoder.frames_seen, decoder.bad_crc
+    except TransportError as exc:
+        print("Ошибка линии: %s" % exc, file=sys.stderr)
+        return 2
+    finally:
+        decoder.flush()
+        transport.close()
+
+    print("Передач: %d, кадров разобрано: %d, из них с несошедшейся CRC: %d"
+          % (tries, total_frames, total_bad))
+    if total_bad:
+        print("\nCRC портится — значит наш сигнал реально ложится на линию. "
+              "Передатчик работает.")
+        print("Если при этом --rs485-probe ответа не даёт, дело не в "
+              "передатчике: плата либо")
+        print("отвечает не всякому адресу, либо не отвечает на запрос "
+              "вообще.")
+        return 0
+
+    print("\nЗа всё время ни одна CRC не испортилась. Похоже, наш сигнал до "
+          "линии не доходит:")
+    print("проверьте перемычку TX-RX (--loopback), полярность A/B и общий "
+          "провод (GND) с платой.")
+    return 1
+
+
+def run_rs485_probe(args) -> int:
+    """Проверяет, отвечает ли плата на наш собственный запрос по шине.
+
+    Пока мы шину только слушали. Прежде чем пытаться ею управлять, надо
+    выяснить простую вещь: слышит ли нас плата вообще. Проба это выясняет,
+    ничего не меняя — по умолчанию отправляется точная копия того запроса,
+    который мастер и так шлёт двадцать раз в минуту (``CMD=0x55``,
+    нагрузка ``00 00 11``), только от чужого, никем не занятого адреса.
+
+    Признаком успеха служит **новизна** кадра, а не его адрес. Судить по
+    адресу нельзя: у мастера ``F1`` он стоит почти в каждом кадре штатного
+    цикла, и такой фильтр объявляет удачей обычную переписку — на живом
+    железе именно это и произошло. Поэтому проба сперва слушает линию и
+    запоминает, из чего цикл состоит, а засчитывает только то, чего в цикле
+    не было: например ответ на пять регистров там, где мастер всегда просит
+    семнадцать.
+
+    Кадр отправляется в паузе между пачками мастера (:data:`PROBE_IDLE`),
+    иначе он наложится на чужую посылку и пропадёт вместе с ней.
+    """
+    from aux_hvac.rs485_protocol import RS485Decoder, RS485Frame
+
+    transport = RS485Transport(
+        port=args.port,
+        baudrate=args.baud,
+        parity=args.parity,
+        timeout=args.read_timeout,
+        address=args.address,
+    )
+
+    try:
+        payload = bytes.fromhex(args.probe_payload.replace(" ", ""))
+    except ValueError:
+        print("Нагрузка --probe-payload должна быть шестнадцатеричной, "
+              "получено %r" % args.probe_payload, file=sys.stderr)
+        return 2
+
+    # собираем и тут же разбираем обратно: так describe() покажет настоящую
+    # длину и сошедшуюся CRC, а не поля пустой заготовки
+    raw = RS485Frame(addr_a=args.probe_from, addr_b=args.probe_to,
+                     cmd=args.probe_cmd, payload=payload).encode()
+    frame = RS485Frame.decode(raw)
+
+    print("RS485: проба передачи. Ничего не меняем — это запрос на чтение.")
+    print("Параметры: %r" % transport)
+    print("Отправляем %d раз: %s" % (args.probe_tries, frame.describe()))
+    print("  байты: %s" % " ".join("%02X" % b for b in raw))
+    print("Ждём ответ, адресованный %02X.\n" % args.probe_from)
+
+    try:
+        transport.open()
+    except TransportError as exc:
+        print("Ошибка: %s" % exc, file=sys.stderr)
+        return 2
+
+    decoder = RS485Decoder()
+    dump = open(args.dump, "ab") if args.dump else None
+    answers, echoes = [], 0
+    baseline = set()
+    echo_meaningful = True
+    quiet_bad = busy_bad = 0
+    # ответы опрашиваемого до пробы и во время неё: если плата нас слышит,
+    # лишние опросы дадут лишние ответы — и это видно даже тогда, когда сам
+    # ответ от штатного не отличается
+    without_us = with_us = sends = 0
+
+    def signature(f):
+        """Чем один кадр цикла отличается от другого.
+
+        Значения регистров сюда не входят: температуры плывут сами по себе,
+        и по ним любой кадр выглядел бы новым. А вот адреса, команда, длина
+        и начало нагрузки — индекс с количеством — от опроса к опросу
+        повторяются в точности.
+        """
+        return (f.addr_a, f.addr_b, f.cmd, len(f.payload), bytes(f.payload[:2]))
+
+    seen_here = []      # кадры, замеченные последним wait_idle()
+
+    def drain(seconds):
+        """Читает линию заданное время, возвращает разобранные кадры."""
+        got = []
+        end = time.monotonic() + seconds
+        while time.monotonic() < end and not _stop:
+            chunk = transport.read(256)
+            if not chunk:
+                time.sleep(0.002)
+                continue
+            if dump is not None:
+                dump.write(chunk)
+            got.extend(decoder.feed(chunk))
+        return got
+
+    def wait_idle(limit=3.0):
+        """Ждёт паузу в линии. Возвращает False, если так и не дождались.
+
+        Кадры, попавшиеся за время ожидания, возвращаются наружу через
+        ``seen_here``: их обязательно надо посчитать, иначе замер частоты
+        сравнивает несравнимое — непрерывное наблюдение в одной фазе с
+        наблюдением по окнам в другой.
+        """
+        del seen_here[:]
+        end = time.monotonic() + limit
+        quiet = time.monotonic()
+        while time.monotonic() < end and not _stop:
+            chunk = transport.read(256)
+            if chunk:
+                if dump is not None:
+                    dump.write(chunk)
+                seen_here.extend(decoder.feed(chunk))
+                quiet = time.monotonic()
+                continue
+            if time.monotonic() - quiet >= PROBE_IDLE:
+                return True
+            time.sleep(0.002)
+        return False
+
+    try:
+        print("Слушаем линию и запоминаем штатный цикл...")
+        before = drain(args.probe_learn)
+        baseline = {signature(f) for f in before}
+        # эхо опознаётся только по совпадению байтов, поэтому оно бессмысленно,
+        # когда точно такой же кадр шлёт кто-то ещё: чужая посылка тогда
+        # неотличима от нашей собственной
+        echo_meaningful = all(f.raw != raw for f in before)
+        without_us = sum(1 for f in before if f.addr_a == args.probe_to)
+        quiet_bad = decoder.bad_crc
+        if before:
+            print("За %.0f с принято кадров: %d, из них разных: %d. Шина живая."
+                  % (args.probe_learn, len(before), len(baseline)))
+        else:
+            print("Ни одного кадра не принято — проверьте линию и скорость.")
+        if args.probe_from in {a for f in before for a in (f.addr_a, f.addr_b)}:
+            print("Замечание: адрес %02X на шине уже занят. Ответ на наш кадр"
+                  % args.probe_from)
+            print("отличим только по содержимому — запрашивайте заведомо")
+            print("непривычное: другое количество регистров или другой индекс.")
+        print("")
+
+        started = time.monotonic()
+        span = 0.0
+        bad_at_start = decoder.bad_crc
+        for attempt in range(1, args.probe_tries + 1):
+            if _stop:
+                break
+            idle = wait_idle()
+            with_us += sum(1 for f in seen_here if f.addr_a == args.probe_to)
+            if not idle:
+                print("%d: паузы в линии не нашлось, пропускаем попытку"
+                      % attempt)
+                continue
+            transport.write(raw)
+            sends += 1
+            replies = drain(args.probe_wait)
+            fresh = []
+            for f in replies:
+                if f.raw == raw and echo_meaningful:
+                    echoes += 1       # адаптер вернул нам нашу же передачу
+                    continue
+                if f.addr_a == args.probe_to:
+                    with_us += 1
+                if signature(f) not in baseline:
+                    fresh.append(f)
+            if fresh:
+                answers.extend(fresh)
+                for f in fresh:
+                    print("%d: НОВЫЙ КАДР  %s" % (attempt, f.describe()))
+                    # запоминаем, иначе один и тот же ответ будет считаться
+                    # новым на каждой попытке и создаст видимость находки
+                    baseline.add(signature(f))
+            else:
+                print("%d: ничего нового (кадров штатного цикла за это время: %d)"
+                      % (attempt, len(replies)))
+        span = time.monotonic() - started
+        busy_bad = decoder.bad_crc - bad_at_start
+    except TransportError as exc:
+        print("Ошибка линии: %s" % exc, file=sys.stderr)
+        return 2
+    finally:
+        decoder.flush()
+        transport.close()
+        if dump is not None:
+            dump.close()
+
+    print("")
+    quiet_rate = without_us / args.probe_learn if args.probe_learn else 0.0
+    busy_rate = with_us / span if span else 0.0
+    print("Ответов от %02X без нас: %d за %.1f с = %.2f/с"
+          % (args.probe_to, without_us, args.probe_learn, quiet_rate))
+    print("Ответов от %02X с нами : %d за %.1f с = %.2f/с "
+          "(отправлено запросов: %d)"
+          % (args.probe_to, with_us, span, busy_rate, sends))
+    print("Битых CRC: без нас %d, с нами %d" % (quiet_bad, busy_bad))
+    if busy_bad > quiet_bad + sends // 4:
+        print("Наши кадры накладываются на чужие — замер частоты этим "
+              "испорчен.")
+        print("Увеличьте --probe-wait, чтобы реже влезать в чужую посылку.")
+    faster = quiet_rate > 0 and busy_rate >= quiet_rate * PROBE_RATE_FACTOR
+    if faster:
+        print("Ответы участились — плата отвечает на наши запросы.")
+    print("")
+
+    if not echo_meaningful:
+        print("Эхо не проверялось: такой же кадр шлёт мастер, и его посылку "
+              "от нашей")
+        print("не отличить. Чтобы проверить передатчик, возьмите адрес, "
+              "которого на")
+        print("шине нет: --probe-from B1.")
+    elif echoes:
+        print("Эхо: %d раз наш кадр вернулся в приёмник целиком и со "
+              "сошедшейся CRC." % echoes)
+        print("Приёмник адаптера слушает саму линию — значит линия была нами "
+              "проведена")
+        print("и кадр в шине действительно был. За ответ такие кадры, "
+              "разумеется, не")
+        print("считались.")
+    else:
+        print("Эха нет. Многие адаптеры его глушат, так что само по себе это "
+              "ещё не")
+        print("приговор передатчику — но и подтверждения передачи у нас нет. "
+              "Проверить")
+        print("однозначно: --probe-collide.")
+    if echoes and not faster and not answers:
+        print("Передатчик работает, но плата на этот кадр не отвечает.")
+        return 1
+
+    if faster and not answers:
+        print("Плата нас слышит: своих кадров она не показала, но отвечать "
+              "стала чаще ровно тогда, когда мы начали спрашивать.")
+        print("Значит передача работает, а нагрузка запроса на форму ответа "
+              "не влияет — количество регистров плата берёт своё.")
+        return 0
+
+    if answers:
+        print("Плата нас слышит: %d кадров, каких в штатном цикле не бывает."
+              % len(answers))
+        print("Значит передача работает и плата приняла именно наш запрос. "
+              "Дальше имеет смысл искать команду записи.")
+        return 0
+
+    print("Плата на наш запрос не отвечает. Причин три, и различать их надо "
+          "по порядку:")
+    print("  1. передатчик до шины не доходит — проверяется --probe-collide;")
+    print("  2. плата отвечает не всякому: попробуйте --probe-from C1, C2, "
+          "CF, E1;")
+    print("  3. ответ платы вообще не вызван запросом, а идёт по её "
+          "собственному")
+    print("     расписанию — тогда управлять чтением её не заставить.")
+    return 1
+
+
 # ===========================================================================
 #  CLI
 # ===========================================================================
@@ -1755,6 +2101,42 @@ def build_parser() -> argparse.ArgumentParser:
                          "(по умолчанию %.1f, что даёт 7 с на каждый вид "
                          "статуса — как в эталонной реализации)"
                          % CORRELATE_POLL_INTERVAL)
+    rs.add_argument("--rs485-probe", action="store_true",
+                    help="проба передачи в шину: отправить свой запрос на "
+                         "чтение и посмотреть, ответит ли плата. Ничего не "
+                         "меняет")
+    rs.add_argument("--probe-collide", type=float, metavar="СЕК",
+                    help="проверка передатчика столкновением: слать мусор "
+                         "поверх чужих передач заданное число секунд и "
+                         "смотреть, портится ли их CRC. Не зависит от того, "
+                         "слышит ли нас плата")
+    rs.add_argument("--probe-from", type=lambda s: int(s, 0), default=0xB1,
+                    metavar="АДР",
+                    help="каким адресом представиться (по умолчанию 0xB1 — "
+                         "он на шине не занят, так ответ нам не спутать с "
+                         "чужим)")
+    rs.add_argument("--probe-to", type=lambda s: int(s, 0), default=0x01,
+                    metavar="АДР",
+                    help="кого спрашиваем (по умолчанию 0x01 — плата, "
+                         "которая отдаёт датчики)")
+    rs.add_argument("--probe-cmd", type=lambda s: int(s, 0), default=0x55,
+                    metavar="КОМ",
+                    help="команда (по умолчанию 0x55 — чтение блока)")
+    rs.add_argument("--probe-payload", default="000011", metavar="HEX",
+                    help="нагрузка (по умолчанию 000011 — ровно то, что "
+                         "шлёт мастер)")
+    rs.add_argument("--probe-learn", type=float, default=5.0, metavar="СЕК",
+                    help="сколько секунд слушать штатный цикл перед пробой, "
+                         "чтобы потом отличить от него ответ (по умолчанию 5)")
+    rs.add_argument("--probe-wait", type=float, default=PROBE_WAIT,
+                    metavar="СЕК",
+                    help="сколько слушать после своего кадра (по умолчанию "
+                         "%.1f). Малое значение вместе с большим "
+                         "--probe-tries даёт частый опрос: так проверяется, "
+                         "вызван ли ответ платы вообще запросом"
+                         % PROBE_WAIT)
+    rs.add_argument("--probe-tries", type=int, default=5, metavar="N",
+                    help="сколько раз повторить (по умолчанию 5)")
     rs.add_argument("--sniff-raw", action="store_true", help="синоним --rs485 для наглядности")
     rs.add_argument("--address", type=lambda s: int(s, 0), default=0x01, help="адрес устройства на шине")
 
@@ -1768,7 +2150,7 @@ def _apply_line_defaults(args) -> None:
     требует протокол AUX), а шина RS485 — на 9600/8-N-1. Поэтому argparse
     оставляет здесь None, а конкретное значение выбирается уже по режиму.
     """
-    rs485 = args.rs485 or args.sniff_raw
+    rs485 = args.rs485 or args.sniff_raw or args.rs485_probe or args.probe_collide
     if args.baud is None:
         args.baud = RS485_BAUDRATE if rs485 else UART_BAUDRATE
     if args.parity is None:
@@ -1814,6 +2196,12 @@ def main(argv: Optional[list] = None) -> int:
             return run_correlate(args)
         # --rs485 проверяем раньше --monitor: у шины своя панель, и общий
         # монитор к ней не подходит — там нет ни опроса, ни статуса блока
+        # проба раньше прослушивания: --rs485-probe подразумевает шину, но
+        # слушать вместо передачи было бы не тем, о чём просили
+        if args.probe_collide:
+            return run_rs485_probe_collide(args)
+        if args.rs485_probe:
+            return run_rs485_probe(args)
         if args.rs485 or args.sniff_raw:
             return run_rs485(args)
         if args.monitor:
